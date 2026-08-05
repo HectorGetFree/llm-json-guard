@@ -1,4 +1,4 @@
-module example.com/modeljson-test
+module github.com/HectorGetFree/llm-json-guard
 
 go 1.24.2
 
