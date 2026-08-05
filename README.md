@@ -1,4 +1,4 @@
-# modeljson-test
+# llm-json-guard
 
 独立测试环境：验证模型 JSON 输出的提取、严格解码、真实 `jsonrepair` 本地修复和一次真实 LLM 兜底。
 
