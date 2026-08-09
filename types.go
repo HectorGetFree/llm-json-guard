@@ -1,6 +1,9 @@
 package llmjsonguard
 
-import "context"
+import (
+	"context"
+	"time"
+)
 
 // ParsePath 记录模型输出通过哪条路径成为可信结果，用于统计模型可靠性和恢复成本。
 type ParsePath string
@@ -52,6 +55,26 @@ type LLMRepairer func(ctx context.Context, request LLMRepairRequest) (string, er
 // Validator 校验仅靠 Go 类型无法表达的领域规则。
 type Validator[T any] func(value T) error
 
+// ParseObserver 在一次公开 Parse 调用完成后接收基础运行数据。
+// Observer 只负责观察，不能修改解析结果，也不应在回调中执行高延迟阻塞操作。
+type ParseObserver func(ctx context.Context, observation ParseObservation)
+
+// ParseObservation 描述一次 Parse 的结果、资源规模和恢复策略使用情况。
+// 该结构不包含原始输出、Schema、候选或错误详情，避免监控链路默认采集业务内容。
+type ParseObservation struct {
+	Success               bool
+	Path                  ParsePath
+	ErrorCode             ErrorCode
+	Stage                 ParseStage
+	Duration              time.Duration
+	InputBytes            int
+	SchemaBytes           int
+	CandidateCount        int
+	LocalRepairAttempts   int
+	LLMRepairCalls        int
+	CandidateLimitReached bool
+}
+
 // ParseLimits 限制模型输入规模和候选提取开销。
 // 字段小于等于零时使用安全默认值，而不是关闭保护。
 type ParseLimits struct {
@@ -71,6 +94,7 @@ type ParseOptions[T any] struct {
 	Validate               Validator[T]
 	AllowLLMSemanticRepair bool
 	Limits                 ParseLimits
+	Observer               ParseObserver
 }
 
 func normalizeLimits(limits ParseLimits) ParseLimits {

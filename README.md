@@ -305,6 +305,36 @@ GOTOOLCHAIN=local go run ./cmd/guard-eval -json
 
 数据集格式、指标定义和已知缺口见 [`evaluation/README.md`](evaluation/README.md)。
 
+## 运行时统计
+
+`ParseOptions.Observer` 会在每次公开 `Parse` 调用完成后同步接收一条基础观测记录：
+
+```go
+observer := func(ctx context.Context, observation llmjsonguard.ParseObservation) {
+    metrics.Total.Add(1)
+    metrics.Duration.Observe(observation.Duration.Seconds())
+    metrics.Paths.Add(string(observation.Path), 1)
+    metrics.Errors.Add(string(observation.ErrorCode), 1)
+}
+
+result, err := llmjsonguard.Parse[Person](ctx, rawModelOutput, llmjsonguard.ParseOptions[Person]{
+    Schema:   personSchema,
+    Observer: observer,
+})
+```
+
+`ParseObservation` 只包含：
+
+- 成功状态、最终路径、错误码和失败阶段；
+- Guard 自身总耗时；
+- 输入和 Schema 字节数；
+- 候选数量与候选限制状态；
+- 本地修复尝试次数和 LLM 调用次数。
+
+它不会记录原始输出、Schema、候选、最终 JSON 或错误详情。Observer 每次调用最多执行一次，不返回错误；其 panic 会被隔离，不会改变解析结果。回调是同步的，但 `Duration` 在调用 Observer 前完成计算，因此不包含监控写入耗时。
+
+同一个 Observer 可能被并发调用，实现方应保证线程安全，并把日志、数据库或网络写入放进自有的有界异步队列，避免阻塞 Guard 链路。
+
 ## 安全说明
 
 - 上传 GitHub 前请运行 `git status --short`，确认没有 `.env`、`.idea`、密钥或本地配置文件；

@@ -6,11 +6,23 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 )
+
+type parseObservationRecorder struct {
+	candidateCount        int
+	localRepairAttempts   int
+	llmRepairCalls        int
+	candidateLimitReached bool
+}
 
 // parseResult 按成本和风险从低到高调度恢复链路。
 // 无论通过哪条路径恢复，结果都必须经过相同的本地解码和业务校验。
 func parseResult[T any](ctx context.Context, rawOutput string, options ParseOptions[T]) (ParseResult[T], error) {
+	return parseResultWithRecorder(ctx, rawOutput, options, nil)
+}
+
+func parseResultWithRecorder[T any](ctx context.Context, rawOutput string, options ParseOptions[T], recorder *parseObservationRecorder) (ParseResult[T], error) {
 	// 1. 提取前校验输入规模，避免异常模型输出占用过多内存和扫描时间。
 	limits := normalizeLimits(options.Limits)
 	if len(rawOutput) > limits.MaxInputBytes {
@@ -57,6 +69,10 @@ func parseResult[T any](ctx context.Context, rawOutput string, options ParseOpti
 	// 3. 只标准化字符串外的结构标点，再按限制提取候选，避免修改业务字段内容。
 	normalizedOutput := normalizeStructurePunctuation(rawOutput)
 	candidates, limitReached := extractJSONCandidatesWithLimits(normalizedOutput, limits)
+	if recorder != nil {
+		recorder.candidateCount = len(candidates)
+		recorder.candidateLimitReached = limitReached
+	}
 	sawSemanticError := false
 	sawLossyRepair := false
 	var lastSemanticError error
@@ -89,6 +105,9 @@ func parseResult[T any](ctx context.Context, rawOutput string, options ParseOpti
 				continue
 			}
 
+			if recorder != nil {
+				recorder.localRepairAttempts++
+			}
 			repaired, err := localRepair(candidate)
 			if err != nil {
 				lastFailure = err
@@ -117,6 +136,9 @@ func parseResult[T any](ctx context.Context, rawOutput string, options ParseOpti
 		validationFailure := "no JSON candidate passed local decoding and validation"
 		if lastFailure != nil {
 			validationFailure = lastFailure.Error()
+		}
+		if recorder != nil {
+			recorder.llmRepairCalls++
 		}
 		fixed, err := options.LLMRepair(ctx, LLMRepairRequest{
 			RawOutput:         rawOutput,
@@ -169,5 +191,39 @@ func parseResult[T any](ctx context.Context, rawOutput string, options ParseOpti
 // Parse 将不可信的模型文本转换为 T。
 // 返回值一定通过严格本地解码和可选业务校验，任何恢复路径都不能绕过该边界。
 func Parse[T any](ctx context.Context, rawOutput string, options ParseOptions[T]) (ParseResult[T], error) {
-	return parseResult(ctx, rawOutput, options)
+	if options.Observer == nil {
+		return parseResult(ctx, rawOutput, options)
+	}
+
+	startedAt := time.Now()
+	recorder := &parseObservationRecorder{}
+	result, err := parseResultWithRecorder(ctx, rawOutput, options, recorder)
+	observation := ParseObservation{
+		Success:               err == nil,
+		Path:                  result.Path,
+		Duration:              time.Since(startedAt),
+		InputBytes:            len(rawOutput),
+		SchemaBytes:           len(options.Schema),
+		CandidateCount:        recorder.candidateCount,
+		LocalRepairAttempts:   recorder.localRepairAttempts,
+		LLMRepairCalls:        recorder.llmRepairCalls,
+		CandidateLimitReached: recorder.candidateLimitReached,
+	}
+	if err != nil {
+		var parseError *ParseError
+		if errors.As(err, &parseError) {
+			observation.ErrorCode = parseError.Code
+			observation.Stage = parseError.Stage
+		}
+	}
+	notifyObserver(ctx, options.Observer, observation)
+	return result, err
+}
+
+// notifyObserver 隔离监控代码的 panic，确保可观测能力失效时不改变业务解析结果。
+func notifyObserver(ctx context.Context, observer ParseObserver, observation ParseObservation) {
+	defer func() {
+		_ = recover()
+	}()
+	observer(ctx, observation)
 }
