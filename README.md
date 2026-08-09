@@ -28,7 +28,8 @@
 ├── llm.go                   # OpenAI-compatible Chat Completions 修复器
 ├── parser_test.go           # 本地测试，调用真实 jsonrepair，但不访问网络
 ├── llm_integration_test.go  # 配置环境变量后调用真实 LLM
-├── AGENTS.md                # 项目编码与命名规范
+├── evaluation/              # 内置 JSONL 数据集、评测 Runner 和指标说明
+├── cmd/guard-eval/          # 离线评测命令入口
 ├── go.mod                   # Go module 与依赖
 └── README.md
 ```
@@ -268,6 +269,41 @@ GOTOOLCHAIN=local go test ./... -run '^TestRealLLMRepair$' -v -count=1
 
 - 合法 JSON 含未知字段、并开启 `AllowLLMSemanticRepair` 时，预期调用 LLM 一次；
 - 截断 JSON 预期由本地 `jsonrepair` 修复，断言 LLM 调用次数为 `0`。
+
+## 能力量化评测
+
+运行不访问网络的默认评测集：
+
+```bash
+GOTOOLCHAIN=local go run ./cmd/guard-eval -iterations 100
+```
+
+输出包括：
+
+- 总体准确率；
+- 直接成功和恢复成功数量；
+- 恢复成功率与恢复增益；
+- 误接收率、误拒绝数和错误值数量；
+- `direct`、`extracted`、`local_repair` 路径分布；
+- 错误码和分类准确率；
+- 端到端 mean、P50 和 P95 延迟。
+
+用于 CI 阈值检查：
+
+```bash
+GOTOOLCHAIN=local go run ./cmd/guard-eval \
+  -iterations 100 \
+  -min-accuracy 0.95 \
+  -max-false-acceptance 0.15
+```
+
+输出机器可读报告：
+
+```bash
+GOTOOLCHAIN=local go run ./cmd/guard-eval -json
+```
+
+数据集格式、指标定义和已知缺口见 [`evaluation/README.md`](evaluation/README.md)。
 
 ## 安全说明
 
