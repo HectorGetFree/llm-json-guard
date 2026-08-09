@@ -2,6 +2,8 @@
 
 一个 Go 工具包，用于将 LLM 的非稳定结构化输出安全地转换为目标 Go 类型。它遵循：**严格解码优先 → 默认安全修复 → 最多一次 LLM 兜底 → Schema 与业务规则统一验收**。
 
+项目当前能力、处理链路和成熟度边界见 [`docs/current_implementation.md`](docs/current_implementation.md)。
+
 ## 功能
 
 - 从原始 JSON、Markdown 代码块和普通文本中提取 JSON 候选；
