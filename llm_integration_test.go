@@ -1,4 +1,4 @@
-package modeljson
+package llmjsonguard
 
 import (
 	"context"
@@ -18,8 +18,7 @@ func TestRealLLMRepair(t *testing.T) {
 		t.Skip("set MODELJSON_LLM_BASE_URL, MODELJSON_LLM_API_KEY, and MODELJSON_LLM_MODEL to run")
 	}
 
-	schema := `{"type":"object","additionalProperties":false,"required":["name","age","tags","active"],"properties":{"name":{"type":"string"},"age":{"type":"integer","minimum":0,"maximum":150},"tags":{"type":"array","items":{"type":"string"}},"active":{"type":"boolean"}}}`
-	repairer, err := NewLLMRepairer(config, schema)
+	repairer, err := NewLLMRepairer(config)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -46,12 +45,13 @@ func TestRealLLMRepair(t *testing.T) {
 	for _, testCase := range tests {
 		t.Run(testCase.name, func(t *testing.T) {
 			calls := 0
-			countedRepairer := func(ctx context.Context, raw string) (string, error) {
+			countedRepairer := func(ctx context.Context, request LLMRepairRequest) (string, error) {
 				calls++
-				return repairer(ctx, raw)
+				return repairer(ctx, request)
 			}
 
 			result, err := Parse[Person](context.Background(), testCase.raw, ParseOptions[Person]{
+				Schema:                 personSchema,
 				LocalRepair:            LocalJSONRepair,
 				LLMRepair:              countedRepairer,
 				Validate:               validatePerson,

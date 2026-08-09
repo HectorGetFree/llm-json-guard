@@ -1,4 +1,4 @@
-package modeljson
+package llmjsonguard
 
 import (
 	"regexp"

@@ -1,4 +1,4 @@
-package modeljson
+package llmjsonguard
 
 import "context"
 
@@ -19,6 +19,7 @@ const (
 // 默认限制用于保护共享服务，避免异常模型响应消耗过多资源。
 const (
 	DefaultMaxInputBytes     = 1 << 20
+	DefaultMaxSchemaBytes    = 1 << 20
 	DefaultMaxCandidateBytes = 1 << 20
 	DefaultMaxCandidates     = 32
 )
@@ -37,8 +38,16 @@ type ParseResult[T any] struct {
 // JSONRepairer 定义确定性语法恢复边界，实现方不能补造业务值或改写合法载荷。
 type JSONRepairer func(input string) (string, error)
 
+// LLMRepairRequest 汇总模型修复所需的唯一契约和失败上下文。
+// Schema 与本地校验共用同一来源，避免提示词约束和最终验收规则漂移。
+type LLMRepairRequest struct {
+	RawOutput         string
+	Schema            string
+	ValidationFailure string
+}
+
 // LLMRepairer 定义高成本兜底边界；Parse 最多调用一次，结果仍须通过本地校验。
-type LLMRepairer func(ctx context.Context, rawOutput string) (string, error)
+type LLMRepairer func(ctx context.Context, request LLMRepairRequest) (string, error)
 
 // Validator 校验仅靠 Go 类型无法表达的领域规则。
 type Validator[T any] func(value T) error
@@ -47,14 +56,17 @@ type Validator[T any] func(value T) error
 // 字段小于等于零时使用安全默认值，而不是关闭保护。
 type ParseLimits struct {
 	MaxInputBytes     int
+	MaxSchemaBytes    int
 	MaxCandidateBytes int
 	MaxCandidates     int
 }
 
 // ParseOptions 声明调用方接受的恢复策略。
-// 本地修复和 LLM 修复只有在显式传入对应函数后才会启用。
+// 安全本地修复默认启用；LLM 修复只有显式传入后才会产生网络调用。
 type ParseOptions[T any] struct {
+	Schema                 string
 	LocalRepair            JSONRepairer
+	DisableLocalRepair     bool
 	LLMRepair              LLMRepairer
 	Validate               Validator[T]
 	AllowLLMSemanticRepair bool
@@ -64,6 +76,9 @@ type ParseOptions[T any] struct {
 func normalizeLimits(limits ParseLimits) ParseLimits {
 	if limits.MaxInputBytes <= 0 {
 		limits.MaxInputBytes = DefaultMaxInputBytes
+	}
+	if limits.MaxSchemaBytes <= 0 {
+		limits.MaxSchemaBytes = DefaultMaxSchemaBytes
 	}
 	if limits.MaxCandidateBytes <= 0 {
 		limits.MaxCandidateBytes = DefaultMaxCandidateBytes

@@ -1,15 +1,17 @@
 # llm-json-guard
 
-一个 Go 工具包，用于将 LLM 的非稳定结构化输出安全地转换为目标 Go 类型。它遵循：**严格解码优先 → 本地确定性修复 → 最多一次 LLM 兜底 → 最终本地验证**。
+一个 Go 工具包，用于将 LLM 的非稳定结构化输出安全地转换为目标 Go 类型。它遵循：**严格解码优先 → 默认安全修复 → 最多一次 LLM 兜底 → Schema 与业务规则统一验收**。
 
 ## 功能
 
 - 从原始 JSON、Markdown 代码块和普通文本中提取 JSON 候选；
 - 处理全角结构标点，并保留不完整的最外层对象 / 数组供 repair 使用；
-- 使用真实 `jsonrepair` 修复裸键、单引号、尾逗号和缺失闭合符号等格式问题；
+- 默认使用安全模式修复裸键、单引号、尾逗号和缺失闭合符号，拒绝补值、删值和根结构重组；
 - 使用 `encoding/json` 严格解码，拒绝未知字段和多个连续 JSON 值；
-- 通过业务回调验证必填字段、空值、范围、枚举和跨字段约束；
+- 使用同一份 JSON Schema 完成本地结构校验和 LLM 修复约束；
+- 通过可选业务回调补充跨字段等领域规则；
 - 在本地无法处理时，支持一次 OpenAI-compatible LLM 修复请求；
+- 核心链路和 LLM 兜底均支持对象与数组根类型；
 - 默认拒绝语义修复，只有显式开启后才允许 LLM 修复合法 JSON 的 Schema / 业务错误。
 
 ## 目录结构
@@ -19,7 +21,8 @@
 ├── parser.go                # 解析与恢复流程调度
 ├── extractor.go             # JSON 候选提取和全角标点标准化
 ├── decoder.go               # 严格解码和业务校验
-├── repair.go                # 本地 jsonrepair 适配
+├── schema.go                # JSON Schema 编译和本地校验
+├── repair.go                # 安全与宽松本地修复策略
 ├── errors.go                # 结构化错误码和阶段
 ├── types.go                 # 公共类型、选项和默认限制
 ├── llm.go                   # OpenAI-compatible Chat Completions 修复器
@@ -40,7 +43,7 @@ LLM endpoint: OpenAI-compatible Chat Completions
 
 ## 使用方式
 
-### 定义目标结构和业务校验
+### 定义目标结构、Schema 和业务校验
 
 ```go
 type Person struct {
@@ -65,14 +68,28 @@ func validatePerson(value Person) error {
     }
     return nil
 }
+
+const personSchema = `{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["name", "age", "tags", "active"],
+  "properties": {
+    "name": {"type": "string", "minLength": 1},
+    "age": {"type": "integer", "minimum": 0, "maximum": 150},
+    "tags": {"type": "array", "items": {"type": "string"}},
+    "active": {"type": "boolean"}
+  }
+}`
 ```
+
+Schema 负责必填字段、类型、范围和数组等结构规则；`Validate` 只补充跨字段或外部状态相关的业务规则。Schema 会在一次 `Parse` 开始时编译一次，并由所有恢复路径复用。外部 `$ref` 默认禁止，避免不可信 Schema 读取文件或访问网络。
 
 ### 仅使用本地提取、repair 和校验
 
 ```go
-result, err := modeljson.Parse[Person](ctx, rawModelOutput, modeljson.ParseOptions[Person]{
-    LocalRepair: modeljson.LocalJSONRepair,
-    Validate:    validatePerson,
+result, err := llmjsonguard.Parse[Person](ctx, rawModelOutput, llmjsonguard.ParseOptions[Person]{
+    Schema:   personSchema,
+    Validate: validatePerson,
 })
 if err != nil {
     return err
@@ -85,27 +102,30 @@ fmt.Println(result.Path) // direct、extracted 或 local_repair
 ### 配置一次 LLM 兜底
 
 ```go
-schema := `{
-  "type": "object",
-  "additionalProperties": false,
-  "required": ["name", "age", "tags", "active"]
-}`
-
-repairer, err := modeljson.NewLLMRepairer(modeljson.LLMConfig{
+repairer, err := llmjsonguard.NewLLMRepairer(llmjsonguard.LLMConfig{
     BaseURL: os.Getenv("MODELJSON_LLM_BASE_URL"),
     APIKey:  os.Getenv("MODELJSON_LLM_API_KEY"),
     Model:   os.Getenv("MODELJSON_LLM_MODEL"),
-}, schema)
+})
 if err != nil {
     return err
 }
 
-result, err := modeljson.Parse[Person](ctx, rawModelOutput, modeljson.ParseOptions[Person]{
-    LocalRepair:             modeljson.LocalJSONRepair,
+result, err := llmjsonguard.Parse[Person](ctx, rawModelOutput, llmjsonguard.ParseOptions[Person]{
+    Schema:                  personSchema,
     LLMRepair:               repairer,
     Validate:                validatePerson,
     AllowLLMSemanticRepair: true,
 })
+```
+
+自定义公司修复服务时实现同一个函数类型即可：
+
+```go
+companyRepairer := func(ctx context.Context, request llmjsonguard.LLMRepairRequest) (string, error) {
+    // request 同时包含 RawOutput、Schema 和本地 ValidationFailure。
+    return companyClient.Repair(ctx, request)
+}
 ```
 
 `ParseResult.Path` 的可能值：
@@ -121,45 +141,68 @@ llm_repair    一次 LLM 修复后通过严格校验
 
 ### 输入限制与结构化错误
 
-解析器默认限制输入和单个候选为 1 MiB、候选数量为 32，可通过
+解析器默认限制输入、Schema 和单个候选为 1 MiB、候选数量为 32，可通过
 `ParseOptions.Limits` 调整：
 
 ```go
-Limits: modeljson.ParseLimits{
+Limits: llmjsonguard.ParseLimits{
     MaxInputBytes:     2 << 20,
+    MaxSchemaBytes:    1 << 20,
     MaxCandidateBytes: 1 << 20,
     MaxCandidates:     16,
 }
 ```
 
-失败会返回 `*modeljson.ParseError`，调用方可通过 `errors.As` 读取稳定的
+失败会返回 `*llmjsonguard.ParseError`，调用方可通过 `errors.As` 读取稳定的
 `Code` 和 `Stage`；所有解析失败仍可通过 `errors.Is(err,
-modeljson.ErrInvalidOutput)` 判断。
+llmjsonguard.ErrInvalidOutput)` 判断。
 
 ## 设计逻辑
 
 ```text
 模型原始输出
-  → 原样严格解码 + 业务校验
+  → 编译一次 JSON Schema
+  → 原样严格解码 + Schema + 业务校验
   → 标准化全角结构标点
   → 提取完整或不完整 JSON 候选
-  → 逐个严格解码 + 业务校验
-  → 仅对语法错误候选执行 jsonrepair
-  → 再次严格解码 + 业务校验
+  → 逐个严格解码 + Schema + 业务校验
+  → 仅对语法错误候选执行安全本地修复
+  → 再次严格解码 + Schema + 业务校验
   → 必要时最多调用一次 LLM
-  → 严格解码 + 业务校验
+  → 严格解码 + Schema + 业务校验
   → 返回结果或错误
 ```
 
 ### 本地 repair 的边界
 
-`LocalJSONRepair` 只处理 JSON **语法和格式**问题，例如：
+`LocalJSONRepair` 默认启用，只处理 JSON **语法和无损格式**问题，例如：
 
 ```js
 {name: 'Alice', tags: ['go',], active: true,}
 ```
 
-它不会处理语义问题。以下输入虽然是合法 JSON，但会在严格解码或业务校验时失败：
+以下可能改变业务事实的修复会返回 `ErrLossyRepair`：
+
+```text
+{"name":}          缺少值时补 null
+[1, 2, ...]        删除省略内容
+"hello" + "world" 合并值
+多个根值           自动重组为数组
+```
+
+确实接受这些行为时，调用方必须显式传入：
+
+```go
+LocalRepair: llmjsonguard.PermissiveLocalJSONRepair
+```
+
+完全关闭本地修复：
+
+```go
+DisableLocalRepair: true
+```
+
+本地修复不会处理语义问题。以下输入虽然是合法 JSON，但会在严格解码、Schema 或业务校验时失败：
 
 ```json
 {"name":"Alice","age":"18","tags":["go"],"active":true}
@@ -171,7 +214,7 @@ modeljson.ErrInvalidOutput)` 判断。
 AllowLLMSemanticRepair: true
 ```
 
-无论 LLM 输出什么，都必须重新通过本地严格解码和 `Validate`。
+无论 LLM 输出什么，都必须重新通过本地严格解码、同一份 Schema 和 `Validate`。
 
 ## LLM 配置
 
@@ -206,11 +249,14 @@ GOTOOLCHAIN=local go test ./... -v -race
 - 裸键、单引号和尾逗号；
 - 全角结构标点；
 - 最外层 JSON 缺少闭合符号；
+- Schema 必填字段、类型和外部引用限制；
+- 默认安全修复与显式宽松修复；
 - 未知字段；
 - 必填业务字段为空；
 - 字段类型错误；
 - 多个连续 JSON 值；
-- 多候选 JSON 提取。
+- 多候选 JSON 提取；
+- 顶层数组的本地解析与 LLM 兜底。
 
 运行真实 LLM 集成测试：
 

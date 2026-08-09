@@ -1,4 +1,4 @@
-package modeljson
+package llmjsonguard
 
 import (
 	"context"
@@ -37,6 +37,8 @@ func validatePerson(value Person) error {
 	}
 	return nil
 }
+
+const personSchema = `{"type":"object","additionalProperties":false,"required":["name","age","tags","active"],"properties":{"name":{"type":"string","minLength":1},"age":{"type":"integer","minimum":0,"maximum":150},"tags":{"type":"array","items":{"type":"string"}},"active":{"type":"boolean"},"profile":{"type":"object","additionalProperties":false,"required":["city"],"properties":{"city":{"type":"string","minLength":1}}}}}`
 
 func TestParseResult(t *testing.T) {
 	valid := `{"name":"Alice","age":18,"tags":["go","llm"],"active":true}`
@@ -95,7 +97,7 @@ func assertParseError(t *testing.T, err error, code ErrorCode) *ParseError {
 }
 
 func TestDecodeAndValidateRejectsMultipleJSONValues(t *testing.T) {
-	_, err := decodeAndValidate[Person]([]byte(`{"name":"Alice","age":18,"tags":[],"active":true} {"name":"Bob","age":20,"tags":[],"active":false}`), validatePerson)
+	_, err := decodeAndValidate[Person]([]byte(`{"name":"Alice","age":18,"tags":[],"active":true} {"name":"Bob","age":20,"tags":[],"active":false}`), nil, validatePerson)
 	if err == nil {
 		t.Fatal("expected multiple JSON values to be rejected")
 	}
@@ -129,6 +131,104 @@ func TestParseTopLevelArray(t *testing.T) {
 	}
 	if result.Path != ParsePathDirect || len(result.Value) != 1 {
 		t.Fatalf("unexpected array result: %#v", result)
+	}
+}
+
+func TestParseUsesSchemaAsStructuralContract(t *testing.T) {
+	t.Run("valid value", func(t *testing.T) {
+		result, err := Parse[Person](context.Background(), `{"name":"Alice","age":18,"tags":[],"active":true}`, ParseOptions[Person]{
+			Schema: personSchema,
+		})
+		if err != nil {
+			t.Fatalf("Parse with Schema: %v", err)
+		}
+		if result.Path != ParsePathDirect {
+			t.Fatalf("path = %q, want %q", result.Path, ParsePathDirect)
+		}
+	})
+
+	t.Run("missing required field", func(t *testing.T) {
+		_, err := Parse[Person](context.Background(), `{"name":"Alice","tags":[],"active":true}`, ParseOptions[Person]{
+			Schema: personSchema,
+		})
+		assertParseError(t, err, ErrorCodeValidationFailed)
+	})
+
+	t.Run("invalid Schema", func(t *testing.T) {
+		_, err := Parse[Person](context.Background(), `{}`, ParseOptions[Person]{
+			Schema: `{"type":`,
+		})
+		parseErr := assertParseError(t, err, ErrorCodeInvalidSchema)
+		if parseErr.Stage != ParseStageSchema {
+			t.Fatalf("stage = %q, want %q", parseErr.Stage, ParseStageSchema)
+		}
+	})
+
+	t.Run("external Schema reference", func(t *testing.T) {
+		_, err := Parse[Person](context.Background(), `{}`, ParseOptions[Person]{
+			Schema: `{"$ref":"https://example.com/person.schema.json"}`,
+		})
+		assertParseError(t, err, ErrorCodeInvalidSchema)
+	})
+}
+
+func TestParseUsesSafeLocalRepairByDefault(t *testing.T) {
+	raw := `{name:'Alice',age:18,tags:[],active:true,}`
+	result, err := Parse[Person](context.Background(), raw, ParseOptions[Person]{
+		Schema: personSchema,
+	})
+	if err != nil {
+		t.Fatalf("Parse with default local repair: %v", err)
+	}
+	if result.Path != ParsePathLocalFix {
+		t.Fatalf("path = %q, want %q", result.Path, ParsePathLocalFix)
+	}
+
+	_, err = Parse[Person](context.Background(), raw, ParseOptions[Person]{
+		Schema:             personSchema,
+		DisableLocalRepair: true,
+	})
+	assertParseError(t, err, ErrorCodeInvalidJSON)
+}
+
+func TestParsePassesSchemaAndFailureToLLMRepair(t *testing.T) {
+	raw := `{"name":"Alice","age":"wrong","tags":[],"active":true}`
+	var received LLMRepairRequest
+	result, err := Parse[Person](context.Background(), raw, ParseOptions[Person]{
+		Schema: personSchema,
+		LLMRepair: func(_ context.Context, request LLMRepairRequest) (string, error) {
+			received = request
+			return `{"name":"Alice","age":18,"tags":[],"active":true}`, nil
+		},
+		AllowLLMSemanticRepair: true,
+	})
+	if err != nil {
+		t.Fatalf("Parse with LLM repair: %v", err)
+	}
+	if result.Path != ParsePathLLMFix {
+		t.Fatalf("path = %q, want %q", result.Path, ParsePathLLMFix)
+	}
+	if received.RawOutput != raw || received.Schema != personSchema || received.ValidationFailure == "" {
+		t.Fatalf("unexpected repair request: %#v", received)
+	}
+}
+
+func TestParseTopLevelArrayThroughLLMRepair(t *testing.T) {
+	schema := `{"type":"array","minItems":1,"items":{"type":"integer"}}`
+	result, err := Parse[[]int](context.Background(), "numbers are one and two", ParseOptions[[]int]{
+		Schema: schema,
+		LLMRepair: func(_ context.Context, request LLMRepairRequest) (string, error) {
+			if request.Schema != schema {
+				t.Fatalf("Schema = %q, want %q", request.Schema, schema)
+			}
+			return `[1,2]`, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("Parse array with LLM repair: %v", err)
+	}
+	if result.Path != ParsePathLLMFix || len(result.Value) != 2 {
+		t.Fatalf("unexpected result: %#v", result)
 	}
 }
 
@@ -167,7 +267,8 @@ func TestParseLimits(t *testing.T) {
 func TestParseLLMRepairFailureIsStructuredAndWrapped(t *testing.T) {
 	repairFailure := errors.New("provider unavailable")
 	_, err := Parse[Person](context.Background(), "not json", ParseOptions[Person]{
-		LLMRepair: func(context.Context, string) (string, error) {
+		Schema: personSchema,
+		LLMRepair: func(context.Context, LLMRepairRequest) (string, error) {
 			return "", repairFailure
 		},
 	})
@@ -182,7 +283,8 @@ func TestParseLLMRepairFailureIsStructuredAndWrapped(t *testing.T) {
 
 func TestParseRejectsInvalidLLMRepairOutput(t *testing.T) {
 	_, err := Parse[Person](context.Background(), "not json", ParseOptions[Person]{
-		LLMRepair: func(context.Context, string) (string, error) {
+		Schema: personSchema,
+		LLMRepair: func(context.Context, LLMRepairRequest) (string, error) {
 			return `{"name":"Alice","age":"wrong"}`, nil
 		},
 	})
@@ -204,4 +306,26 @@ func TestParseTruncatedStringFailsWithoutInventingContent(t *testing.T) {
 	if !errors.Is(err, ErrInvalidOutput) {
 		t.Fatalf("error must match ErrInvalidOutput: %v", err)
 	}
+}
+
+func TestLocalJSONRepairRejectsLossyChanges(t *testing.T) {
+	_, err := LocalJSONRepair(`{"name":}`)
+	if !errors.Is(err, ErrLossyRepair) {
+		t.Fatalf("error = %v, want ErrLossyRepair", err)
+	}
+
+	repaired, err := PermissiveLocalJSONRepair(`{"name":}`)
+	if err != nil {
+		t.Fatalf("PermissiveLocalJSONRepair: %v", err)
+	}
+	if repaired != `{"name":null}` {
+		t.Fatalf("repaired = %s, want null insertion", repaired)
+	}
+}
+
+func TestParseReportsRejectedLossyRepair(t *testing.T) {
+	_, err := Parse[map[string]any](context.Background(), `{"name":}`, ParseOptions[map[string]any]{
+		LocalRepair: LocalJSONRepair,
+	})
+	assertParseError(t, err, ErrorCodeLossyRepair)
 }

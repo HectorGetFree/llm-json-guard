@@ -1,4 +1,4 @@
-package modeljson
+package llmjsonguard
 
 import (
 	"errors"
@@ -10,6 +10,10 @@ var (
 	ErrNoJSONCandidate = errors.New("no complete JSON candidate found")
 	// ErrInvalidOutput 是所有模型输出解析失败共享的哨兵错误。
 	ErrInvalidOutput = errors.New("model output could not be parsed and validated")
+	// ErrLossyRepair 用于识别本地修复可能新增、删除或重组业务数据的情况。
+	ErrLossyRepair = errors.New("lossy JSON repair rejected")
+	// ErrLLMRepairRefused 表示模型遵循协议并明确声明无法在不编造数据的前提下修复。
+	ErrLLMRepairRefused = errors.New("LLM refused unsafe JSON repair")
 )
 
 // ErrorCode 提供稳定的失败分类，供指标统计和重试策略使用。
@@ -19,8 +23,10 @@ type ErrorCode string
 const (
 	ErrorCodeEmptyOutput      ErrorCode = "empty_output"
 	ErrorCodeInputTooLarge    ErrorCode = "input_too_large"
+	ErrorCodeInvalidSchema    ErrorCode = "invalid_schema"
 	ErrorCodeNoCandidate      ErrorCode = "no_candidate"
 	ErrorCodeInvalidJSON      ErrorCode = "invalid_json"
+	ErrorCodeLossyRepair      ErrorCode = "lossy_repair_rejected"
 	ErrorCodeValidationFailed ErrorCode = "validation_failed"
 	ErrorCodeCandidateLimit   ErrorCode = "candidate_limit"
 	ErrorCodeLLMRepairFailed  ErrorCode = "llm_repair_failed"
@@ -32,6 +38,7 @@ type ParseStage string
 // 阶段值与错误文案解耦，避免文案调整破坏监控面板。
 const (
 	ParseStageInput       ParseStage = "input"
+	ParseStageSchema      ParseStage = "schema"
 	ParseStageExtraction  ParseStage = "extraction"
 	ParseStageLocalRepair ParseStage = "local_repair"
 	ParseStageValidation  ParseStage = "validation"

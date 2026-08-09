@@ -1,4 +1,4 @@
-package modeljson
+package llmjsonguard
 
 import (
 	"context"
@@ -25,11 +25,32 @@ func parseResult[T any](ctx context.Context, rawOutput string, options ParseOpti
 	if rawOutput == "" {
 		return ParseResult[T]{}, newParseError(ErrorCodeEmptyOutput, ParseStageInput, errors.New("empty output"))
 	}
+	if len(options.Schema) > limits.MaxSchemaBytes {
+		return ParseResult[T]{RawOutput: rawOutput}, newParseError(
+			ErrorCodeInvalidSchema,
+			ParseStageSchema,
+			fmt.Errorf("schema is %d bytes, limit is %d", len(options.Schema), limits.MaxSchemaBytes),
+		)
+	}
+	if options.LLMRepair != nil && strings.TrimSpace(options.Schema) == "" {
+		return ParseResult[T]{RawOutput: rawOutput}, newParseError(
+			ErrorCodeInvalidSchema,
+			ParseStageSchema,
+			errors.New("Schema is required when LLM repair is enabled"),
+		)
+	}
+	schema, err := compileJSONSchema(options.Schema)
+	if err != nil {
+		return ParseResult[T]{RawOutput: rawOutput}, newParseError(ErrorCodeInvalidSchema, ParseStageSchema, err)
+	}
 
 	// 2. 优先解析原始输出，保留模型原意，并避免对正常输出执行不必要的恢复。
+	var lastFailure error
 	if len(rawOutput) <= limits.MaxCandidateBytes {
-		if value, err := decodeAndValidate[T]([]byte(rawOutput), options.Validate); err == nil {
+		if value, decodeErr := decodeAndValidate[T]([]byte(rawOutput), schema, options.Validate); decodeErr == nil {
 			return ParseResult[T]{Value: value, JSON: rawOutput, Path: ParsePathDirect, RawOutput: rawOutput}, nil
+		} else {
+			lastFailure = decodeErr
 		}
 	}
 
@@ -37,16 +58,19 @@ func parseResult[T any](ctx context.Context, rawOutput string, options ParseOpti
 	normalizedOutput := normalizeStructurePunctuation(rawOutput)
 	candidates, limitReached := extractJSONCandidatesWithLimits(normalizedOutput, limits)
 	sawSemanticError := false
+	sawLossyRepair := false
 	var lastSemanticError error
+	var lastLossyRepairError error
 
 	// 4. 优先选择无需修复且通过本地规则的候选。
 	// 合法 JSON 如果校验失败，应归类为语义错误，不能交给语法修复器静默改写。
 	for _, candidate := range candidates {
-		value, err := decodeAndValidate[T]([]byte(candidate), options.Validate)
+		value, err := decodeAndValidate[T]([]byte(candidate), schema, options.Validate)
 		if err == nil {
 			return ParseResult[T]{Value: value, JSON: candidate, Path: ParsePathExtracted, RawOutput: rawOutput}, nil
 		}
-		if json.Valid([]byte(candidate)) {
+		lastFailure = err
+		if json.Valid([]byte(candidate)) && schema.matchesRootType(candidate) {
 			sawSemanticError = true
 			if lastSemanticError == nil {
 				lastSemanticError = err
@@ -55,19 +79,29 @@ func parseResult[T any](ctx context.Context, rawOutput string, options ParseOpti
 	}
 
 	// 5. 仅修复语法非法的候选，避免把 Schema 或业务错误伪装成格式问题。
-	if options.LocalRepair != nil {
+	localRepair := options.LocalRepair
+	if localRepair == nil && !options.DisableLocalRepair {
+		localRepair = LocalJSONRepair
+	}
+	if localRepair != nil {
 		for _, candidate := range candidates {
 			if json.Valid([]byte(candidate)) {
 				continue
 			}
 
-			repaired, err := options.LocalRepair(candidate)
+			repaired, err := localRepair(candidate)
 			if err != nil {
+				lastFailure = err
+				if errors.Is(err, ErrLossyRepair) {
+					sawLossyRepair = true
+					lastLossyRepairError = err
+				}
 				continue
 			}
 
-			value, err := decodeAndValidate[T]([]byte(repaired), options.Validate)
+			value, err := decodeAndValidate[T]([]byte(repaired), schema, options.Validate)
 			if err != nil {
+				lastFailure = err
 				continue
 			}
 
@@ -80,7 +114,15 @@ func parseResult[T any](ctx context.Context, rawOutput string, options ParseOpti
 
 	// 6. LLM 兜底最多调用一次；语义修复必须显式开启，防止模型为满足目标而编造数据。
 	if options.LLMRepair != nil && (!sawSemanticError || options.AllowLLMSemanticRepair) {
-		fixed, err := options.LLMRepair(ctx, rawOutput)
+		validationFailure := "no JSON candidate passed local decoding and validation"
+		if lastFailure != nil {
+			validationFailure = lastFailure.Error()
+		}
+		fixed, err := options.LLMRepair(ctx, LLMRepairRequest{
+			RawOutput:         rawOutput,
+			Schema:            options.Schema,
+			ValidationFailure: validationFailure,
+		})
 		if err != nil {
 			return ParseResult[T]{RawOutput: rawOutput}, newParseError(ErrorCodeLLMRepairFailed, ParseStageLLMRepair, err)
 		}
@@ -93,7 +135,7 @@ func parseResult[T any](ctx context.Context, rawOutput string, options ParseOpti
 				fmt.Errorf("LLM output is %d bytes, candidate limit is %d", len(fixed), limits.MaxCandidateBytes),
 			)
 		}
-		value, err := decodeAndValidate[T]([]byte(fixed), options.Validate)
+		value, err := decodeAndValidate[T]([]byte(fixed), schema, options.Validate)
 		if err != nil {
 			return ParseResult[T]{RawOutput: rawOutput}, newParseError(ErrorCodeLLMRepairFailed, ParseStageValidation, err)
 		}
@@ -114,6 +156,9 @@ func parseResult[T any](ctx context.Context, rawOutput string, options ParseOpti
 	}
 	if sawSemanticError {
 		return ParseResult[T]{RawOutput: rawOutput}, newParseError(ErrorCodeValidationFailed, ParseStageValidation, lastSemanticError)
+	}
+	if sawLossyRepair {
+		return ParseResult[T]{RawOutput: rawOutput}, newParseError(ErrorCodeLossyRepair, ParseStageLocalRepair, lastLossyRepairError)
 	}
 	if limitReached {
 		return ParseResult[T]{RawOutput: rawOutput}, newParseError(ErrorCodeCandidateLimit, ParseStageExtraction, errors.New("candidate limit reached"))
