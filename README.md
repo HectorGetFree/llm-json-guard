@@ -16,10 +16,16 @@
 
 ```text
 .
-├── parser.go                # 提取、严格解码、本地 repair 与 LLM 调度
+├── parser.go                # 解析与恢复流程调度
+├── extractor.go             # JSON 候选提取和全角标点标准化
+├── decoder.go               # 严格解码和业务校验
+├── repair.go                # 本地 jsonrepair 适配
+├── errors.go                # 结构化错误码和阶段
+├── types.go                 # 公共类型、选项和默认限制
 ├── llm.go                   # OpenAI-compatible Chat Completions 修复器
 ├── parser_test.go           # 本地测试，调用真实 jsonrepair，但不访问网络
 ├── llm_integration_test.go  # 配置环境变量后调用真实 LLM
+├── AGENTS.md                # 项目编码与命名规范
 ├── go.mod                   # Go module 与依赖
 └── README.md
 ```
@@ -73,7 +79,7 @@ if err != nil {
 }
 
 person := result.Value
-fmt.Println(result.Path) // raw 或 local_repair
+fmt.Println(result.Path) // direct、extracted 或 local_repair
 ```
 
 ### 配置一次 LLM 兜底
@@ -105,10 +111,30 @@ result, err := modeljson.Parse[Person](ctx, rawModelOutput, modeljson.ParseOptio
 `ParseResult.Path` 的可能值：
 
 ```text
-raw           原始文本或提取出的候选直接通过严格校验
+direct        原始文本直接通过严格校验
+extracted     从 Markdown 或普通文本提取出的候选通过严格校验
 local_repair  真实 jsonrepair 修复后通过严格校验
 llm_repair    一次 LLM 修复后通过严格校验
 ```
+
+旧名称 `ParsePathRaw` 保留为 `ParsePathDirect` 的兼容别名。
+
+### 输入限制与结构化错误
+
+解析器默认限制输入和单个候选为 1 MiB、候选数量为 32，可通过
+`ParseOptions.Limits` 调整：
+
+```go
+Limits: modeljson.ParseLimits{
+    MaxInputBytes:     2 << 20,
+    MaxCandidateBytes: 1 << 20,
+    MaxCandidates:     16,
+}
+```
+
+失败会返回 `*modeljson.ParseError`，调用方可通过 `errors.As` 读取稳定的
+`Code` 和 `Stage`；所有解析失败仍可通过 `errors.Is(err,
+modeljson.ErrInvalidOutput)` 判断。
 
 ## 设计逻辑
 

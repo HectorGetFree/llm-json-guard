@@ -1,76 +1,50 @@
 package modeljson
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
-	"regexp"
 	"strings"
-
-	jsonrepair "github.com/kaptinlin/jsonrepair"
 )
 
-var (
-	ErrNoJSONCandidate = errors.New("no complete JSON candidate found")
-	ErrInvalidOutput   = errors.New("model output could not be parsed and validated")
-)
-
-type ParsePath string
-
-const (
-	ParsePathRaw      ParsePath = "raw"
-	ParsePathLocalFix ParsePath = "local_repair"
-	ParsePathLLMFix   ParsePath = "llm_repair"
-)
-
-type ParseResult[T any] struct {
-	Value      T
-	JSON       string
-	Path       ParsePath
-	RawOutput  string
-	UsedRepair bool
-	UsedLLMFix bool
-}
-
-type JSONRepairer func(input string) (string, error)
-type LLMRepairer func(ctx context.Context, rawOutput string) (string, error)
-type Validator[T any] func(value T) error
-
-type ParseOptions[T any] struct {
-	LocalRepair            JSONRepairer
-	LLMRepair              LLMRepairer
-	Validate               Validator[T]
-	AllowLLMSemanticRepair bool
-}
-
-// LocalJSONRepair adapts the real jsonrepair library to the parser pipeline.
-func LocalJSONRepair(input string) (string, error) {
-	return jsonrepair.JSONRepair(input)
-}
-
-// parseResult parses model output through the normal, local-repair, and one-shot LLM paths.
+// parseResult 按成本和风险从低到高调度恢复链路。
+// 无论通过哪条路径恢复，结果都必须经过相同的本地解码和业务校验。
 func parseResult[T any](ctx context.Context, rawOutput string, options ParseOptions[T]) (ParseResult[T], error) {
+	// 1. 提取前校验输入规模，避免异常模型输出占用过多内存和扫描时间。
+	limits := normalizeLimits(options.Limits)
+	if len(rawOutput) > limits.MaxInputBytes {
+		return ParseResult[T]{}, newParseError(
+			ErrorCodeInputTooLarge,
+			ParseStageInput,
+			fmt.Errorf("input is %d bytes, limit is %d", len(rawOutput), limits.MaxInputBytes),
+		)
+	}
+
 	rawOutput = strings.TrimSpace(rawOutput)
 	if rawOutput == "" {
-		return ParseResult[T]{}, fmt.Errorf("%w: empty output", ErrInvalidOutput)
+		return ParseResult[T]{}, newParseError(ErrorCodeEmptyOutput, ParseStageInput, errors.New("empty output"))
 	}
 
-	if value, err := decodeAndValidate[T]([]byte(rawOutput), options.Validate); err == nil {
-		return ParseResult[T]{Value: value, JSON: rawOutput, Path: ParsePathRaw, RawOutput: rawOutput}, nil
+	// 2. 优先解析原始输出，保留模型原意，并避免对正常输出执行不必要的恢复。
+	if len(rawOutput) <= limits.MaxCandidateBytes {
+		if value, err := decodeAndValidate[T]([]byte(rawOutput), options.Validate); err == nil {
+			return ParseResult[T]{Value: value, JSON: rawOutput, Path: ParsePathDirect, RawOutput: rawOutput}, nil
+		}
 	}
 
+	// 3. 只标准化字符串外的结构标点，再按限制提取候选，避免修改业务字段内容。
 	normalizedOutput := normalizeStructurePunctuation(rawOutput)
-	candidates := extractJSONCandidates(normalizedOutput)
+	candidates, limitReached := extractJSONCandidatesWithLimits(normalizedOutput, limits)
 	sawSemanticError := false
 	var lastSemanticError error
 
+	// 4. 优先选择无需修复且通过本地规则的候选。
+	// 合法 JSON 如果校验失败，应归类为语义错误，不能交给语法修复器静默改写。
 	for _, candidate := range candidates {
 		value, err := decodeAndValidate[T]([]byte(candidate), options.Validate)
 		if err == nil {
-			return ParseResult[T]{Value: value, JSON: candidate, Path: ParsePathRaw, RawOutput: rawOutput}, nil
+			return ParseResult[T]{Value: value, JSON: candidate, Path: ParsePathExtracted, RawOutput: rawOutput}, nil
 		}
 		if json.Valid([]byte(candidate)) {
 			sawSemanticError = true
@@ -80,6 +54,7 @@ func parseResult[T any](ctx context.Context, rawOutput string, options ParseOpti
 		}
 	}
 
+	// 5. 仅修复语法非法的候选，避免把 Schema 或业务错误伪装成格式问题。
 	if options.LocalRepair != nil {
 		for _, candidate := range candidates {
 			if json.Valid([]byte(candidate)) {
@@ -103,16 +78,24 @@ func parseResult[T any](ctx context.Context, rawOutput string, options ParseOpti
 		}
 	}
 
+	// 6. LLM 兜底最多调用一次；语义修复必须显式开启，防止模型为满足目标而编造数据。
 	if options.LLMRepair != nil && (!sawSemanticError || options.AllowLLMSemanticRepair) {
 		fixed, err := options.LLMRepair(ctx, rawOutput)
 		if err != nil {
-			return ParseResult[T]{RawOutput: rawOutput}, fmt.Errorf("%w: LLM repair request failed: %v", ErrInvalidOutput, err)
+			return ParseResult[T]{RawOutput: rawOutput}, newParseError(ErrorCodeLLMRepairFailed, ParseStageLLMRepair, err)
 		}
 
 		fixed = strings.TrimSpace(fixed)
+		if len(fixed) > limits.MaxCandidateBytes {
+			return ParseResult[T]{RawOutput: rawOutput}, newParseError(
+				ErrorCodeLLMRepairFailed,
+				ParseStageLLMRepair,
+				fmt.Errorf("LLM output is %d bytes, candidate limit is %d", len(fixed), limits.MaxCandidateBytes),
+			)
+		}
 		value, err := decodeAndValidate[T]([]byte(fixed), options.Validate)
 		if err != nil {
-			return ParseResult[T]{RawOutput: rawOutput}, fmt.Errorf("%w: LLM-repaired JSON failed strict validation: %v", ErrInvalidOutput, err)
+			return ParseResult[T]{RawOutput: rawOutput}, newParseError(ErrorCodeLLMRepairFailed, ParseStageValidation, err)
 		}
 
 		return ParseResult[T]{
@@ -121,210 +104,25 @@ func parseResult[T any](ctx context.Context, rawOutput string, options ParseOpti
 		}, nil
 	}
 
+	// 7. 对最终失败分类，供调用方决策和指标统计。
+	// 限制类错误单独返回，因为不调整限制时重试相同输入没有意义。
 	if len(candidates) == 0 {
-		return ParseResult[T]{RawOutput: rawOutput}, fmt.Errorf("%w: %w", ErrInvalidOutput, ErrNoJSONCandidate)
+		if limitReached {
+			return ParseResult[T]{RawOutput: rawOutput}, newParseError(ErrorCodeCandidateLimit, ParseStageExtraction, errors.New("candidate limit reached"))
+		}
+		return ParseResult[T]{RawOutput: rawOutput}, newParseError(ErrorCodeNoCandidate, ParseStageExtraction, ErrNoJSONCandidate)
 	}
 	if sawSemanticError {
-		if lastSemanticError != nil {
-			return ParseResult[T]{RawOutput: rawOutput}, fmt.Errorf(
-				"%w: JSON is syntactically valid but violates the target schema or business rules: %v",
-				ErrInvalidOutput,
-				lastSemanticError,
-			)
-		}
-		return ParseResult[T]{RawOutput: rawOutput}, fmt.Errorf("%w: JSON is syntactically valid but violates the target schema or business rules", ErrInvalidOutput)
+		return ParseResult[T]{RawOutput: rawOutput}, newParseError(ErrorCodeValidationFailed, ParseStageValidation, lastSemanticError)
 	}
-	return ParseResult[T]{RawOutput: rawOutput}, fmt.Errorf("%w: local parsing and repair failed", ErrInvalidOutput)
+	if limitReached {
+		return ParseResult[T]{RawOutput: rawOutput}, newParseError(ErrorCodeCandidateLimit, ParseStageExtraction, errors.New("candidate limit reached"))
+	}
+	return ParseResult[T]{RawOutput: rawOutput}, newParseError(ErrorCodeInvalidJSON, ParseStageLocalRepair, errors.New("local parsing and repair failed"))
 }
 
-// Parse is the exported entry point for callers outside this package.
+// Parse 将不可信的模型文本转换为 T。
+// 返回值一定通过严格本地解码和可选业务校验，任何恢复路径都不能绕过该边界。
 func Parse[T any](ctx context.Context, rawOutput string, options ParseOptions[T]) (ParseResult[T], error) {
 	return parseResult(ctx, rawOutput, options)
-}
-
-func decodeAndValidate[T any](input []byte, validate Validator[T]) (T, error) {
-	var value T
-	decoder := json.NewDecoder(bytes.NewReader(input))
-	decoder.DisallowUnknownFields()
-
-	if err := decoder.Decode(&value); err != nil {
-		return value, fmt.Errorf("decode JSON: %w", err)
-	}
-
-	var extra any
-	if err := decoder.Decode(&extra); err != io.EOF {
-		if err == nil {
-			return value, errors.New("unexpected additional JSON value")
-		}
-		return value, fmt.Errorf("unexpected trailing content: %w", err)
-	}
-
-	if validate != nil {
-		if err := validate(value); err != nil {
-			return value, fmt.Errorf("business validation: %w", err)
-		}
-	}
-	return value, nil
-}
-
-var fencedCodeBlockPattern = regexp.MustCompile("(?s)```(?:json|JSON)?\\s*(.*?)\\s*```")
-
-func extractJSONCandidates(input string) []string {
-	seen := make(map[string]struct{})
-	var candidates []string
-	appendCandidate := func(candidate string) {
-		candidate = strings.TrimSpace(candidate)
-		if candidate == "" {
-			return
-		}
-		if _, exists := seen[candidate]; exists {
-			return
-		}
-		seen[candidate] = struct{}{}
-		candidates = append(candidates, candidate)
-	}
-
-	for _, match := range fencedCodeBlockPattern.FindAllStringSubmatch(input, -1) {
-		if len(match) < 2 {
-			continue
-		}
-		block := strings.TrimSpace(match[1])
-		appendCandidate(block)
-		for _, candidate := range extractBalancedCandidates(block) {
-			appendCandidate(candidate)
-		}
-		appendCandidate(extractIncompleteCandidate(block))
-	}
-	for _, candidate := range extractBalancedCandidates(input) {
-		appendCandidate(candidate)
-	}
-	appendCandidate(extractIncompleteCandidate(input))
-	return candidates
-}
-
-// extractIncompleteCandidate returns the first object or array that starts in
-// input but does not close. It is only useful as a fallback input for a JSON
-// repairer; it is still rejected unless repair and strict validation succeed.
-func extractIncompleteCandidate(input string) string {
-	for start := 0; start < len(input); start++ {
-		if input[start] != '{' && input[start] != '[' {
-			continue
-		}
-		if _, complete := findBalancedEnd(input, start); !complete {
-			return strings.TrimSpace(input[start:])
-		}
-	}
-	return ""
-}
-
-func extractBalancedCandidates(input string) []string {
-	var candidates []string
-	for start := 0; start < len(input); start++ {
-		if input[start] != '{' && input[start] != '[' {
-			continue
-		}
-		end, ok := findBalancedEnd(input, start)
-		if ok {
-			candidates = append(candidates, input[start:end+1])
-		}
-	}
-	return candidates
-}
-
-func findBalancedEnd(input string, start int) (int, bool) {
-	stack := make([]byte, 0, 8)
-	inDoubleQuote := false
-	inSingleQuote := false
-	escaped := false
-	for index := start; index < len(input); index++ {
-		current := input[index]
-		if escaped {
-			escaped = false
-			continue
-		}
-		if (inDoubleQuote || inSingleQuote) && current == '\\' {
-			escaped = true
-			continue
-		}
-		if !inSingleQuote && current == '"' {
-			inDoubleQuote = !inDoubleQuote
-			continue
-		}
-		if !inDoubleQuote && current == '\'' {
-			inSingleQuote = !inSingleQuote
-			continue
-		}
-		if inDoubleQuote || inSingleQuote {
-			continue
-		}
-		switch current {
-		case '{', '[':
-			stack = append(stack, current)
-		case '}':
-			if len(stack) == 0 || stack[len(stack)-1] != '{' {
-				return 0, false
-			}
-			stack = stack[:len(stack)-1]
-		case ']':
-			if len(stack) == 0 || stack[len(stack)-1] != '[' {
-				return 0, false
-			}
-			stack = stack[:len(stack)-1]
-		}
-		if len(stack) == 0 {
-			return index, true
-		}
-	}
-	return 0, false
-}
-
-func normalizeStructurePunctuation(input string) string {
-	var output strings.Builder
-	output.Grow(len(input))
-	inDoubleQuote := false
-	inSingleQuote := false
-	escaped := false
-	for _, current := range input {
-		if escaped {
-			output.WriteRune(current)
-			escaped = false
-			continue
-		}
-		if (inDoubleQuote || inSingleQuote) && current == '\\' {
-			output.WriteRune(current)
-			escaped = true
-			continue
-		}
-		if !inSingleQuote && current == '"' {
-			inDoubleQuote = !inDoubleQuote
-			output.WriteRune(current)
-			continue
-		}
-		if !inDoubleQuote && current == '\'' {
-			inSingleQuote = !inSingleQuote
-			output.WriteRune(current)
-			continue
-		}
-		if inDoubleQuote || inSingleQuote {
-			output.WriteRune(current)
-			continue
-		}
-		switch current {
-		case '｛':
-			output.WriteRune('{')
-		case '｝':
-			output.WriteRune('}')
-		case '［':
-			output.WriteRune('[')
-		case '］':
-			output.WriteRune(']')
-		case '：':
-			output.WriteRune(':')
-		case '，':
-			output.WriteRune(',')
-		default:
-			output.WriteRune(current)
-		}
-	}
-	return output.String()
 }

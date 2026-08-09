@@ -41,28 +41,26 @@ func validatePerson(value Person) error {
 func TestParseResult(t *testing.T) {
 	valid := `{"name":"Alice","age":18,"tags":["go","llm"],"active":true}`
 	tests := []struct {
-		name    string
-		raw     string
-		repair  JSONRepairer
-		path    ParsePath
-		wantErr string
+		name     string
+		raw      string
+		repair   JSONRepairer
+		path     ParsePath
+		wantCode ErrorCode
 	}{
-		{"raw valid JSON", valid, nil, ParsePathRaw, ""},
-		{"markdown code block", "结果：\n```json\n" + valid + "\n```", nil, ParsePathRaw, ""},
+		{"raw valid JSON", valid, nil, ParsePathDirect, ""},
+		{"markdown code block", "结果：\n```json\n" + valid + "\n```", nil, ParsePathExtracted, ""},
 		{"bare keys single quotes trailing commas", `{name: 'Alice', age: 18, tags: ['go', 'llm',], active: true,}`, LocalJSONRepair, ParsePathLocalFix, ""},
 		{"full width structural punctuation", `｛name:"Alice"，age:18，tags:["go"]，active:true｝`, LocalJSONRepair, ParsePathLocalFix, ""},
 		{"incomplete outer JSON repaired locally", `{"name":"Alice","age":18,"tags":["go","llm"],"active":true`, LocalJSONRepair, ParsePathLocalFix, ""},
-		{"unknown field rejected", valid[:len(valid)-1] + `,"role":"admin"}`, nil, "", "schema or business rules"},
-		{"empty required business field rejected", `{"name":"  ","age":18,"tags":["go"],"active":true}`, nil, "", `field "name" is required`},
-		{"wrong type rejected without LLM", `{"name":"Alice","age":"18","tags":["go"],"active":true}`, nil, "", "schema or business rules"},
+		{"unknown field rejected", valid[:len(valid)-1] + `,"role":"admin"}`, nil, "", ErrorCodeValidationFailed},
+		{"empty required business field rejected", `{"name":"  ","age":18,"tags":["go"],"active":true}`, nil, "", ErrorCodeValidationFailed},
+		{"wrong type rejected without LLM", `{"name":"Alice","age":"18","tags":["go"],"active":true}`, nil, "", ErrorCodeValidationFailed},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			result, err := parseResult[Person](context.Background(), tt.raw, ParseOptions[Person]{LocalRepair: tt.repair, Validate: validatePerson})
-			if tt.wantErr != "" {
-				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
-					t.Fatalf("error = %v, want substring %q", err, tt.wantErr)
-				}
+			if tt.wantCode != "" {
+				assertParseError(t, err, tt.wantCode)
 			} else {
 				if err != nil {
 					t.Fatalf("parseResult error: %v", err)
@@ -78,6 +76,24 @@ func TestParseResult(t *testing.T) {
 	}
 }
 
+func assertParseError(t *testing.T, err error, code ErrorCode) *ParseError {
+	t.Helper()
+	if err == nil {
+		t.Fatalf("expected parse error %q", code)
+	}
+	var parseErr *ParseError
+	if !errors.As(err, &parseErr) {
+		t.Fatalf("error type = %T, want *ParseError: %v", err, err)
+	}
+	if parseErr.Code != code {
+		t.Fatalf("error code = %q, want %q: %v", parseErr.Code, code, err)
+	}
+	if !errors.Is(err, ErrInvalidOutput) {
+		t.Fatalf("error must match ErrInvalidOutput: %v", err)
+	}
+	return parseErr
+}
+
 func TestDecodeAndValidateRejectsMultipleJSONValues(t *testing.T) {
 	_, err := decodeAndValidate[Person]([]byte(`{"name":"Alice","age":18,"tags":[],"active":true} {"name":"Bob","age":20,"tags":[],"active":false}`), validatePerson)
 	if err == nil {
@@ -86,8 +102,106 @@ func TestDecodeAndValidateRejectsMultipleJSONValues(t *testing.T) {
 }
 
 func TestExtractJSONCandidates(t *testing.T) {
-	candidates := extractJSONCandidates("说明\n```json\n{\"name\":\"Alice\"}\n```\n其他 {\"ignored\":true}")
+	candidates, limitReached := extractJSONCandidatesWithLimits(
+		"说明\n```json\n{\"name\":\"Alice\"}\n```\n其他 {\"ignored\":true}",
+		normalizeLimits(ParseLimits{}),
+	)
+	if limitReached {
+		t.Fatal("default candidate limit should not be reached")
+	}
 	if len(candidates) != 2 {
 		t.Fatalf("candidate count = %d, want 2: %#v", len(candidates), candidates)
+	}
+}
+
+func TestParseTopLevelArray(t *testing.T) {
+	raw := `[{"name":"Alice","age":18,"tags":[],"active":true}]`
+	result, err := Parse[[]Person](context.Background(), raw, ParseOptions[[]Person]{
+		Validate: func(value []Person) error {
+			if len(value) != 1 {
+				return errors.New("expected one person")
+			}
+			return validatePerson(value[0])
+		},
+	})
+	if err != nil {
+		t.Fatalf("Parse array: %v", err)
+	}
+	if result.Path != ParsePathDirect || len(result.Value) != 1 {
+		t.Fatalf("unexpected array result: %#v", result)
+	}
+}
+
+func TestParseSelectsValidCandidate(t *testing.T) {
+	raw := `first {"name":"","age":18,"tags":[],"active":true} second {"name":"Bob","age":20,"tags":[],"active":false}`
+	result, err := Parse[Person](context.Background(), raw, ParseOptions[Person]{Validate: validatePerson})
+	if err != nil {
+		t.Fatalf("Parse multiple candidates: %v", err)
+	}
+	if result.Path != ParsePathExtracted || result.Value.Name == nil || *result.Value.Name != "Bob" {
+		t.Fatalf("unexpected selected candidate: %#v", result)
+	}
+}
+
+func TestParseLimits(t *testing.T) {
+	t.Run("input bytes", func(t *testing.T) {
+		_, err := Parse[Person](context.Background(), `{}`, ParseOptions[Person]{
+			Limits: ParseLimits{MaxInputBytes: 1},
+		})
+		parseErr := assertParseError(t, err, ErrorCodeInputTooLarge)
+		if parseErr.Stage != ParseStageInput {
+			t.Fatalf("stage = %q, want %q", parseErr.Stage, ParseStageInput)
+		}
+	})
+
+	t.Run("candidate count", func(t *testing.T) {
+		raw := `broken {bad} valid {"name":"Alice","age":18,"tags":[],"active":true}`
+		_, err := Parse[Person](context.Background(), raw, ParseOptions[Person]{
+			Validate: validatePerson,
+			Limits:   ParseLimits{MaxCandidates: 1},
+		})
+		assertParseError(t, err, ErrorCodeCandidateLimit)
+	})
+}
+
+func TestParseLLMRepairFailureIsStructuredAndWrapped(t *testing.T) {
+	repairFailure := errors.New("provider unavailable")
+	_, err := Parse[Person](context.Background(), "not json", ParseOptions[Person]{
+		LLMRepair: func(context.Context, string) (string, error) {
+			return "", repairFailure
+		},
+	})
+	parseErr := assertParseError(t, err, ErrorCodeLLMRepairFailed)
+	if parseErr.Stage != ParseStageLLMRepair {
+		t.Fatalf("stage = %q, want %q", parseErr.Stage, ParseStageLLMRepair)
+	}
+	if !errors.Is(err, repairFailure) {
+		t.Fatalf("error must wrap repair failure: %v", err)
+	}
+}
+
+func TestParseRejectsInvalidLLMRepairOutput(t *testing.T) {
+	_, err := Parse[Person](context.Background(), "not json", ParseOptions[Person]{
+		LLMRepair: func(context.Context, string) (string, error) {
+			return `{"name":"Alice","age":"wrong"}`, nil
+		},
+	})
+	parseErr := assertParseError(t, err, ErrorCodeLLMRepairFailed)
+	if parseErr.Stage != ParseStageValidation {
+		t.Fatalf("stage = %q, want %q", parseErr.Stage, ParseStageValidation)
+	}
+}
+
+func TestParseTruncatedStringFailsWithoutInventingContent(t *testing.T) {
+	raw := `{"name":"Alice","age":18,"tags":["unfinished]`
+	_, err := Parse[Person](context.Background(), raw, ParseOptions[Person]{
+		LocalRepair: LocalJSONRepair,
+		Validate:    validatePerson,
+	})
+	if err == nil {
+		t.Fatal("expected truncated string to fail")
+	}
+	if !errors.Is(err, ErrInvalidOutput) {
+		t.Fatalf("error must match ErrInvalidOutput: %v", err)
 	}
 }

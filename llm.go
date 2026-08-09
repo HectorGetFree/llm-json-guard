@@ -12,16 +12,19 @@ import (
 	"time"
 )
 
+// LLMConfig 配置可选的网络兜底。
+// 它与解析器分离，使本地恢复无需密钥或网络也能独立使用。
 type LLMConfig struct {
-	BaseURL string
-	APIKey  string
-	Model   string
-	Timeout time.Duration
+	BaseURL string        // BaseURL 是供应商 API 根地址，通常以 /v1 结尾。
+	APIKey  string        // APIKey 用于认证修复请求。
+	Model   string        // Model 标识执行修复的模型。
+	Timeout time.Duration // Timeout 限制完整 HTTP 请求耗时。
 }
 
-// NewLLMRepairer creates a one-shot JSON repairer for an OpenAI-compatible
-// Chat Completions endpoint. schema is a JSON Schema or concise schema contract.
+// NewLLMRepairer 创建 OpenAI-compatible 修复器，请求模型返回一个满足 Schema 的 JSON 对象。
+// 解析器负责限制调用次数并执行最终校验；该适配器每次调用只发送一个 HTTP 请求。
 func NewLLMRepairer(config LLMConfig, schema string) (LLMRepairer, error) {
+	// 1. 创建修复器时校验固定配置，避免运行时把配置缺失误判为解析失败。
 	baseURL := strings.TrimRight(strings.TrimSpace(config.BaseURL), "/")
 	if baseURL == "" || strings.TrimSpace(config.APIKey) == "" || strings.TrimSpace(config.Model) == "" {
 		return nil, errors.New("LLM BaseURL, APIKey, and Model are required")
@@ -37,6 +40,7 @@ func NewLLMRepairer(config LLMConfig, schema string) (LLMRepairer, error) {
 	client := &http.Client{Timeout: timeout}
 
 	return func(ctx context.Context, rawOutput string) (string, error) {
+		// 2. 限制模型只返回一个 JSON 对象且不得编造数据；复用调用方 Schema，避免双重契约。
 		payload := chatCompletionRequest{
 			Model: config.Model,
 			Messages: []chatMessage{
@@ -47,6 +51,7 @@ func NewLLMRepairer(config LLMConfig, schema string) (LLMRepairer, error) {
 			Temperature:    0,
 		}
 
+		// 3. 发送一次有界请求；上下文取消和客户端超时优先，修复层不能延长调用方截止时间。
 		body, err := json.Marshal(payload)
 		if err != nil {
 			return "", fmt.Errorf("marshal LLM request: %w", err)
@@ -65,6 +70,7 @@ func NewLLMRepairer(config LLMConfig, schema string) (LLMRepairer, error) {
 		}
 		defer response.Body.Close()
 
+		// 4. 解码前限制响应读取规模，防止修复供应商通过超大响应绕过资源保护。
 		responseBody, err := io.ReadAll(io.LimitReader(response.Body, 2<<20))
 		if err != nil {
 			return "", fmt.Errorf("read LLM response: %w", err)
@@ -73,6 +79,7 @@ func NewLLMRepairer(config LLMConfig, schema string) (LLMRepairer, error) {
 			return "", fmt.Errorf("LLM returned HTTP %d: %s", response.StatusCode, strings.TrimSpace(string(responseBody)))
 		}
 
+		// 5. 只返回消息正文；修复结果是否可信仍由主解析器统一判断。
 		var decoded chatCompletionResponse
 		if err := json.Unmarshal(responseBody, &decoded); err != nil {
 			return "", fmt.Errorf("decode LLM response: %w", err)
