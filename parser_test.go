@@ -193,11 +193,16 @@ func TestParseUsesSafeLocalRepairByDefault(t *testing.T) {
 
 func TestParsePassesSchemaAndFailureToLLMRepair(t *testing.T) {
 	raw := `{"name":"Alice","age":"wrong","tags":[],"active":true}`
-	var received LLMRepairRequest
+	model := &struct{}{}
+	var received []ChatMessage
 	result, err := Parse[Person](context.Background(), raw, ParseOptions[Person]{
-		Schema: personSchema,
-		LLMRepair: func(_ context.Context, request LLMRepairRequest) (string, error) {
-			received = request
+		Schema:          personSchema,
+		RepairChatModel: model,
+		CallRepairChatModel: func(_ context.Context, chatModel any, messages []ChatMessage) (string, error) {
+			if chatModel != model {
+				t.Fatal("unexpected repair model")
+			}
+			received = messages
 			return `{"name":"Alice","age":18,"tags":[],"active":true}`, nil
 		},
 		AllowLLMSemanticRepair: true,
@@ -208,18 +213,25 @@ func TestParsePassesSchemaAndFailureToLLMRepair(t *testing.T) {
 	if result.Path != ParsePathLLMFix {
 		t.Fatalf("path = %q, want %q", result.Path, ParsePathLLMFix)
 	}
-	if received.RawOutput != raw || received.Schema != personSchema || received.ValidationFailure == "" {
-		t.Fatalf("unexpected repair request: %#v", received)
+	if len(received) != 2 || received[0].Role != "system" || received[1].Role != "user" {
+		t.Fatalf("unexpected repair messages: %#v", received)
+	}
+	for _, expected := range []string{raw, personSchema, "age"} {
+		if !strings.Contains(received[1].Content, expected) {
+			t.Fatalf("repair prompt does not contain %q: %s", expected, received[1].Content)
+		}
 	}
 }
 
 func TestParseTopLevelArrayThroughLLMRepair(t *testing.T) {
 	schema := `{"type":"array","minItems":1,"items":{"type":"integer"}}`
+	model := &struct{}{}
 	result, err := Parse[[]int](context.Background(), "numbers are one and two", ParseOptions[[]int]{
-		Schema: schema,
-		LLMRepair: func(_ context.Context, request LLMRepairRequest) (string, error) {
-			if request.Schema != schema {
-				t.Fatalf("Schema = %q, want %q", request.Schema, schema)
+		Schema:          schema,
+		RepairChatModel: model,
+		CallRepairChatModel: func(_ context.Context, chatModel any, messages []ChatMessage) (string, error) {
+			if chatModel != model || !strings.Contains(messages[1].Content, schema) {
+				t.Fatal("repair call did not receive model and Schema")
 			}
 			return `[1,2]`, nil
 		},
@@ -266,9 +278,11 @@ func TestParseLimits(t *testing.T) {
 
 func TestParseLLMRepairFailureIsStructuredAndWrapped(t *testing.T) {
 	repairFailure := errors.New("provider unavailable")
+	model := &struct{}{}
 	_, err := Parse[Person](context.Background(), "not json", ParseOptions[Person]{
-		Schema: personSchema,
-		LLMRepair: func(context.Context, LLMRepairRequest) (string, error) {
+		Schema:          personSchema,
+		RepairChatModel: model,
+		CallRepairChatModel: func(context.Context, any, []ChatMessage) (string, error) {
 			return "", repairFailure
 		},
 	})
@@ -283,8 +297,9 @@ func TestParseLLMRepairFailureIsStructuredAndWrapped(t *testing.T) {
 
 func TestParseRejectsInvalidLLMRepairOutput(t *testing.T) {
 	_, err := Parse[Person](context.Background(), "not json", ParseOptions[Person]{
-		Schema: personSchema,
-		LLMRepair: func(context.Context, LLMRepairRequest) (string, error) {
+		Schema:          personSchema,
+		RepairChatModel: &struct{}{},
+		CallRepairChatModel: func(context.Context, any, []ChatMessage) (string, error) {
 			return `{"name":"Alice","age":"wrong"}`, nil
 		},
 	})

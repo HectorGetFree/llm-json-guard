@@ -38,16 +38,15 @@ type ParseResult[T any] struct {
 // JSONRepairer 定义确定性语法恢复边界，实现方不能补造业务值或改写合法载荷。
 type JSONRepairer func(input string) (string, error)
 
-// LLMRepairRequest 汇总模型修复所需的唯一契约和失败上下文。
-// Schema 与本地校验共用同一来源，避免提示词约束和最终验收规则漂移。
-type LLMRepairRequest struct {
-	RawOutput         string
-	Schema            string
-	ValidationFailure string
+// ChatMessage 是 Guard 构造的模型消息。调用方只负责映射到自身 ChatModel 的消息类型。
+type ChatMessage struct {
+	Role    string
+	Content string
 }
 
-// LLMRepairer 定义高成本兜底边界；Parse 最多调用一次，结果仍须通过本地校验。
-type LLMRepairer func(ctx context.Context, request LLMRepairRequest) (string, error)
+// ChatModelCaller 定义黑盒模型调用边界。
+// ChatModel 可以是任意项目的具体模型实例，Guard 不依赖其类型或 Generate 方法。
+type ChatModelCaller func(ctx context.Context, chatModel any, messages []ChatMessage) (string, error)
 
 // Validator 校验仅靠 Go 类型无法表达的领域规则。
 type Validator[T any] func(value T) error
@@ -67,7 +66,8 @@ type ParseOptions[T any] struct {
 	Schema                 string
 	LocalRepair            JSONRepairer
 	DisableLocalRepair     bool
-	LLMRepair              LLMRepairer
+	RepairChatModel        any
+	CallRepairChatModel    ChatModelCaller
 	Validate               Validator[T]
 	AllowLLMSemanticRepair bool
 	Limits                 ParseLimits

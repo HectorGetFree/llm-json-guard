@@ -102,31 +102,18 @@ fmt.Println(result.Path) // direct、extracted 或 local_repair
 ### 配置一次 LLM 兜底
 
 ```go
-repairer, err := llmjsonguard.NewLLMRepairer(llmjsonguard.LLMConfig{
-    BaseURL: os.Getenv("MODELJSON_LLM_BASE_URL"),
-    APIKey:  os.Getenv("MODELJSON_LLM_API_KEY"),
-    Model:   os.Getenv("MODELJSON_LLM_MODEL"),
-})
-if err != nil {
-    return err
-}
-
 result, err := llmjsonguard.Parse[Person](ctx, rawModelOutput, llmjsonguard.ParseOptions[Person]{
     Schema:                  personSchema,
-    LLMRepair:               repairer,
+    RepairChatModel:         chatModel,
+    CallRepairChatModel: func(ctx context.Context, chatModel any, messages []llmjsonguard.ChatMessage) (string, error) {
+        return callCompanyChatModel(ctx, chatModel, messages)
+    },
     Validate:                validatePerson,
     AllowLLMSemanticRepair: true,
 })
 ```
 
-自定义公司修复服务时实现同一个函数类型即可：
-
-```go
-companyRepairer := func(ctx context.Context, request llmjsonguard.LLMRepairRequest) (string, error) {
-    // request 同时包含 RawOutput、Schema 和本地 ValidationFailure。
-    return companyClient.Repair(ctx, request)
-}
-```
+Guard 自己生成修复 Prompt、Schema 约束和最终验收。调用方只提供具体 ChatModel 实例及其调用方式；Guard 不依赖该模型的具体类型或 `Generate` 方法。
 
 `ParseResult.Path` 的可能值：
 

@@ -32,12 +32,15 @@ func parseResult[T any](ctx context.Context, rawOutput string, options ParseOpti
 			fmt.Errorf("schema is %d bytes, limit is %d", len(options.Schema), limits.MaxSchemaBytes),
 		)
 	}
-	if options.LLMRepair != nil && strings.TrimSpace(options.Schema) == "" {
+	if (options.RepairChatModel != nil || options.CallRepairChatModel != nil) && strings.TrimSpace(options.Schema) == "" {
 		return ParseResult[T]{RawOutput: rawOutput}, newParseError(
 			ErrorCodeInvalidSchema,
 			ParseStageSchema,
 			errors.New("Schema is required when LLM repair is enabled"),
 		)
+	}
+	if (options.RepairChatModel == nil) != (options.CallRepairChatModel == nil) {
+		return ParseResult[T]{RawOutput: rawOutput}, newParseError(ErrorCodeLLMRepairFailed, ParseStageLLMRepair, errors.New("RepairChatModel and CallRepairChatModel must be configured together"))
 	}
 	schema, err := compileJSONSchema(options.Schema)
 	if err != nil {
@@ -113,16 +116,12 @@ func parseResult[T any](ctx context.Context, rawOutput string, options ParseOpti
 	}
 
 	// 6. LLM 兜底最多调用一次；语义修复必须显式开启，防止模型为满足目标而编造数据。
-	if options.LLMRepair != nil && (!sawSemanticError || options.AllowLLMSemanticRepair) {
+	if options.RepairChatModel != nil && (!sawSemanticError || options.AllowLLMSemanticRepair) {
 		validationFailure := "no JSON candidate passed local decoding and validation"
 		if lastFailure != nil {
 			validationFailure = lastFailure.Error()
 		}
-		fixed, err := options.LLMRepair(ctx, LLMRepairRequest{
-			RawOutput:         rawOutput,
-			Schema:            options.Schema,
-			ValidationFailure: validationFailure,
-		})
+		fixed, err := options.CallRepairChatModel(ctx, options.RepairChatModel, buildRepairMessages(rawOutput, options.Schema, validationFailure))
 		if err != nil {
 			return ParseResult[T]{RawOutput: rawOutput}, newParseError(ErrorCodeLLMRepairFailed, ParseStageLLMRepair, err)
 		}
