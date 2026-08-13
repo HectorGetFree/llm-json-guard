@@ -1,4 +1,4 @@
-package llmjsonguard
+package jsonguard
 
 import (
 	"fmt"
@@ -9,7 +9,7 @@ import (
 	jsonrepair "github.com/kaptinlin/jsonrepair"
 )
 
-// LocalJSONRepair 在 LLM 兜底前提供确定性语法恢复。
+// LocalJSONRepair 在外部兜底前提供确定性语法恢复。
 // 默认拒绝补值、删除占位内容和根结构重组，防止通用修复库静默改变业务事实。
 func LocalJSONRepair(input string) (string, error) {
 	if reason := detectLossyRepairRisk(input); reason != "" {

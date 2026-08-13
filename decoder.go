@@ -1,4 +1,4 @@
-package llmjsonguard
+package jsonguard
 
 import (
 	"bytes"

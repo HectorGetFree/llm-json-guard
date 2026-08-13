@@ -1,4 +1,4 @@
-package llmjsonguard
+package jsonguard
 
 import (
 	"errors"
@@ -12,8 +12,8 @@ var (
 	ErrInvalidOutput = errors.New("model output could not be parsed and validated")
 	// ErrLossyRepair 用于识别本地修复可能新增、删除或重组业务数据的情况。
 	ErrLossyRepair = errors.New("lossy JSON repair rejected")
-	// ErrLLMRepairRefused 表示模型遵循协议并明确声明无法在不编造数据的前提下修复。
-	ErrLLMRepairRefused = errors.New("LLM refused unsafe JSON repair")
+	// ErrRepairRefused 表示外部修复器明确拒绝可能改变业务事实的修复。
+	ErrRepairRefused = errors.New("external repair refused unsafe JSON repair")
 )
 
 // ErrorCode 提供稳定的失败分类，供指标统计和重试策略使用。
@@ -29,7 +29,7 @@ const (
 	ErrorCodeLossyRepair      ErrorCode = "lossy_repair_rejected"
 	ErrorCodeValidationFailed ErrorCode = "validation_failed"
 	ErrorCodeCandidateLimit   ErrorCode = "candidate_limit"
-	ErrorCodeLLMRepairFailed  ErrorCode = "llm_repair_failed"
+	ErrorCodeRepairFailed     ErrorCode = "external_repair_failed"
 )
 
 // ParseStage 标识输出在可信处理链路中停止的阶段。
@@ -42,7 +42,7 @@ const (
 	ParseStageExtraction  ParseStage = "extraction"
 	ParseStageLocalRepair ParseStage = "local_repair"
 	ParseStageValidation  ParseStage = "validation"
-	ParseStageLLMRepair   ParseStage = "llm_repair"
+	ParseStageRepair      ParseStage = "external_repair"
 )
 
 // ParseError 提供错误码、阶段和根因，使调用方无需解析文案即可决定重试、降级或拒绝。

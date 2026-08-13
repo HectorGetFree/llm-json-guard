@@ -1,4 +1,4 @@
-package llmjsonguard
+package jsonguard
 
 import (
 	"context"
@@ -32,11 +32,11 @@ func parseResult[T any](ctx context.Context, rawOutput string, options ParseOpti
 			fmt.Errorf("schema is %d bytes, limit is %d", len(options.Schema), limits.MaxSchemaBytes),
 		)
 	}
-	if options.LLMRepair != nil && strings.TrimSpace(options.Schema) == "" {
+	if options.Repair != nil && strings.TrimSpace(options.Schema) == "" {
 		return ParseResult[T]{RawOutput: rawOutput}, newParseError(
 			ErrorCodeInvalidSchema,
 			ParseStageSchema,
-			errors.New("Schema is required when LLM repair is enabled"),
+			errors.New("Schema is required when external repair is enabled"),
 		)
 	}
 	schema, err := compileJSONSchema(options.Schema)
@@ -112,37 +112,37 @@ func parseResult[T any](ctx context.Context, rawOutput string, options ParseOpti
 		}
 	}
 
-	// 6. LLM 兜底最多调用一次；语义修复必须显式开启，防止模型为满足目标而编造数据。
-	if options.LLMRepair != nil && (!sawSemanticError || options.AllowLLMSemanticRepair) {
+	// 6. 外部兜底最多调用一次；语义修复必须显式开启，防止修复器改写业务事实。
+	if options.Repair != nil && (!sawSemanticError || options.AllowSemanticRepair) {
 		validationFailure := "no JSON candidate passed local decoding and validation"
 		if lastFailure != nil {
 			validationFailure = lastFailure.Error()
 		}
-		fixed, err := options.LLMRepair(ctx, LLMRepairRequest{
+		fixed, err := options.Repair(ctx, RepairRequest{
 			RawOutput:         rawOutput,
 			Schema:            options.Schema,
 			ValidationFailure: validationFailure,
 		})
 		if err != nil {
-			return ParseResult[T]{RawOutput: rawOutput}, newParseError(ErrorCodeLLMRepairFailed, ParseStageLLMRepair, err)
+			return ParseResult[T]{RawOutput: rawOutput}, newParseError(ErrorCodeRepairFailed, ParseStageRepair, err)
 		}
 
 		fixed = strings.TrimSpace(fixed)
 		if len(fixed) > limits.MaxCandidateBytes {
 			return ParseResult[T]{RawOutput: rawOutput}, newParseError(
-				ErrorCodeLLMRepairFailed,
-				ParseStageLLMRepair,
-				fmt.Errorf("LLM output is %d bytes, candidate limit is %d", len(fixed), limits.MaxCandidateBytes),
+				ErrorCodeRepairFailed,
+				ParseStageRepair,
+				fmt.Errorf("external repair output is %d bytes, candidate limit is %d", len(fixed), limits.MaxCandidateBytes),
 			)
 		}
 		value, err := decodeAndValidate[T]([]byte(fixed), schema, options.Validate)
 		if err != nil {
-			return ParseResult[T]{RawOutput: rawOutput}, newParseError(ErrorCodeLLMRepairFailed, ParseStageValidation, err)
+			return ParseResult[T]{RawOutput: rawOutput}, newParseError(ErrorCodeRepairFailed, ParseStageValidation, err)
 		}
 
 		return ParseResult[T]{
-			Value: value, JSON: fixed, Path: ParsePathLLMFix,
-			RawOutput: rawOutput, UsedLLMFix: true,
+			Value: value, JSON: fixed, Path: ParsePathExternalRepair,
+			RawOutput: rawOutput, UsedRepair: true,
 		}, nil
 	}
 

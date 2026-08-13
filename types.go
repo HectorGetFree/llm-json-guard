@@ -1,16 +1,16 @@
-package llmjsonguard
+package jsonguard
 
 import "context"
 
 // ParsePath 记录模型输出通过哪条路径成为可信结果，用于统计模型可靠性和恢复成本。
 type ParsePath string
 
-// 成功路径区分直接解析、提取、本地修复和 LLM 修复，避免恢复过程不可观测。
+// 成功路径区分直接解析、提取、本地修复和外部修复，避免恢复过程不可观测。
 const (
-	ParsePathDirect    ParsePath = "direct"
-	ParsePathExtracted ParsePath = "extracted"
-	ParsePathLocalFix  ParsePath = "local_repair"
-	ParsePathLLMFix    ParsePath = "llm_repair"
+	ParsePathDirect         ParsePath = "direct"
+	ParsePathExtracted      ParsePath = "extracted"
+	ParsePathLocalFix       ParsePath = "local_repair"
+	ParsePathExternalRepair ParsePath = "external_repair"
 
 	// ParsePathRaw 是 ParsePathDirect 的源码兼容别名。
 	ParsePathRaw ParsePath = ParsePathDirect
@@ -32,22 +32,21 @@ type ParseResult[T any] struct {
 	Path       ParsePath
 	RawOutput  string
 	UsedRepair bool
-	UsedLLMFix bool
 }
 
 // JSONRepairer 定义确定性语法恢复边界，实现方不能补造业务值或改写合法载荷。
 type JSONRepairer func(input string) (string, error)
 
-// LLMRepairRequest 汇总模型修复所需的唯一契约和失败上下文。
+// RepairRequest 汇总外部修复所需的唯一契约和失败上下文。
 // Schema 与本地校验共用同一来源，避免提示词约束和最终验收规则漂移。
-type LLMRepairRequest struct {
+type RepairRequest struct {
 	RawOutput         string
 	Schema            string
 	ValidationFailure string
 }
 
-// LLMRepairer 定义高成本兜底边界；Parse 最多调用一次，结果仍须通过本地校验。
-type LLMRepairer func(ctx context.Context, request LLMRepairRequest) (string, error)
+// RepairFunc 定义高成本兜底边界；Parse 最多调用一次，结果仍须通过本地校验。
+type RepairFunc func(ctx context.Context, request RepairRequest) (string, error)
 
 // Validator 校验仅靠 Go 类型无法表达的领域规则。
 type Validator[T any] func(value T) error
@@ -62,15 +61,15 @@ type ParseLimits struct {
 }
 
 // ParseOptions 声明调用方接受的恢复策略。
-// 安全本地修复默认启用；LLM 修复只有显式传入后才会产生网络调用。
+// 安全本地修复默认启用；外部修复只有显式传入后才会执行调用方逻辑。
 type ParseOptions[T any] struct {
-	Schema                 string
-	LocalRepair            JSONRepairer
-	DisableLocalRepair     bool
-	LLMRepair              LLMRepairer
-	Validate               Validator[T]
-	AllowLLMSemanticRepair bool
-	Limits                 ParseLimits
+	Schema              string
+	LocalRepair         JSONRepairer
+	DisableLocalRepair  bool
+	Repair              RepairFunc
+	Validate            Validator[T]
+	AllowSemanticRepair bool
+	Limits              ParseLimits
 }
 
 func normalizeLimits(limits ParseLimits) ParseLimits {
