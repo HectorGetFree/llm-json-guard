@@ -6,7 +6,7 @@
 
 ```text
 严格解析 → JSON 候选提取 → 安全本地修复 → Schema → Validator
-       → 可选 RepairFunc → 再次执行完整验收
+       → 可选 LLMRepairFunc → 再次执行完整验收
 ```
 
 ## 安装
@@ -38,45 +38,45 @@ trustedJSON := result.JSON
 
 `Schema` 和 `Validate` 均可选。不传时仍会执行严格解析、候选提取和默认安全本地修复。
 
-## 外部修复
+## 大模型修复
 
 仓库不内置 LLM 或网络调用，只提供通用扩展点：
 
 ```go
-type RepairRequest struct {
+type LLMRepairRequest struct {
     RawOutput         string
     Schema            string
     ValidationFailure string
 }
 
-type RepairFunc func(
+type LLMRepairFunc func(
     ctx context.Context,
-    request RepairRequest,
+    request LLMRepairRequest,
 ) (string, error)
 ```
 
 调用方可以自由接入 RPC、内部模型或其他修复服务：
 
 ```go
-repairFunc := func(ctx context.Context, req jsonguard.RepairRequest) (string, error) {
+llmRepairFunc := func(ctx context.Context, req jsonguard.LLMRepairRequest) (string, error) {
     return repairService.Repair(ctx, req)
 }
 
 result, err := jsonguard.Parse[Target](ctx, rawOutput, jsonguard.ParseOptions[Target]{
     Schema:              targetSchema,
     Validate:            validateTarget,
-    Repair:              repairFunc,
-    AllowSemanticRepair: true,
+    LLMRepair:           llmRepairFunc,
+    AllowLLMSemanticRepair: true,
 })
 ```
 
 约束：
 
 - 配置 `Repair` 时必须同时提供 Schema；
-- 每次 `Parse` 最多调用一次外部修复；
-- Schema 或业务语义错误默认不会交给外部修复；
-- 只有显式启用 `AllowSemanticRepair` 才允许尝试语义修复；
-- 外部修复结果仍须通过严格解码、同一份 Schema 和 Validator。
+- 每次 `Parse` 最多调用一次大模型修复；
+- Schema 或业务语义错误默认不会交给大模型修复；
+- 只有显式启用 `AllowLLMSemanticRepair` 才允许大模型尝试语义修复；
+- 大模型修复结果仍须通过严格解码、同一份 Schema 和 Validator。
 
 ## Schema 与 Validator
 
@@ -122,7 +122,7 @@ DisableLocalRepair: true
 direct           原始输出直接通过。
 extracted        提取出的 JSON 候选通过。
 local_repair     安全本地修复结果通过。
-external_repair  RepairFunc 返回结果通过。
+llm_repair       LLMRepairFunc 返回结果通过。
 ```
 
 失败返回 `*jsonguard.ParseError`，其中包含稳定的 `Code`、`Stage` 和根因。所有解析失败也支持：
@@ -139,4 +139,4 @@ errors.Is(err, jsonguard.ErrInvalidOutput)
 GOTOOLCHAIN=local go test ./... -race
 ```
 
-测试覆盖对象与数组、Markdown 提取、严格解码、Schema、Validator、安全本地修复、外部修复及各类限制。测试不会访问模型或网络。
+测试覆盖对象与数组、Markdown 提取、严格解码、Schema、Validator、安全本地修复、大模型修复及各类限制。默认测试不会访问模型或网络。

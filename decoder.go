@@ -17,16 +17,16 @@ func decodeAndValidate[T any](input []byte, schema *compiledSchema, validate Val
 	decoder.DisallowUnknownFields()
 
 	if err := decoder.Decode(&value); err != nil {
-		return value, fmt.Errorf("decode JSON: %w", err)
+		return value, fmt.Errorf("JSON 解码失败: %w", err)
 	}
 
 	// 2. 限制输入只能包含一个 JSON 值，避免首个合法值掩盖尾部说明或冲突数据。
 	var extra any
 	if err := decoder.Decode(&extra); err != io.EOF {
 		if err == nil {
-			return value, errors.New("unexpected additional JSON value")
+			return value, errors.New("JSON 后存在额外的 JSON 值")
 		}
-		return value, fmt.Errorf("decode trailing JSON content: %w", err)
+		return value, fmt.Errorf("JSON 尾随内容解码失败: %w", err)
 	}
 
 	// 3. 使用调用方 Schema 校验原始 JSON 值，使必填字段、数组和组合约束保持统一来源。
@@ -37,7 +37,7 @@ func decodeAndValidate[T any](input []byte, schema *compiledSchema, validate Val
 	// 4. Schema 通过后再执行领域规则，补充跨字段等 JSON Schema 难以表达的业务约束。
 	if validate != nil {
 		if err := validate(value); err != nil {
-			return value, fmt.Errorf("validate business value: %w", err)
+			return value, fmt.Errorf("业务数据校验失败: %w", err)
 		}
 	}
 	return value, nil

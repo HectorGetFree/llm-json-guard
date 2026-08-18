@@ -1,10 +1,17 @@
 package jsonguard
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
 	"strings"
 	"testing"
+	"time"
 )
 
 type Person struct {
@@ -56,7 +63,7 @@ func TestParseResult(t *testing.T) {
 		{"incomplete outer JSON repaired locally", `{"name":"Alice","age":18,"tags":["go","llm"],"active":true`, LocalJSONRepair, ParsePathLocalFix, ""},
 		{"unknown field rejected", valid[:len(valid)-1] + `,"role":"admin"}`, nil, "", ErrorCodeValidationFailed},
 		{"empty required business field rejected", `{"name":"  ","age":18,"tags":["go"],"active":true}`, nil, "", ErrorCodeValidationFailed},
-		{"wrong type rejected without external repair", `{"name":"Alice","age":"18","tags":["go"],"active":true}`, nil, "", ErrorCodeValidationFailed},
+		{"类型错误且未启用大模型修复", `{"name":"Alice","age":"18","tags":["go"],"active":true}`, nil, "", ErrorCodeValidationFailed},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -121,7 +128,7 @@ func TestParseTopLevelArray(t *testing.T) {
 	result, err := Parse[[]Person](context.Background(), raw, ParseOptions[[]Person]{
 		Validate: func(value []Person) error {
 			if len(value) != 1 {
-				return errors.New("expected one person")
+				return errors.New("必须且只能包含一个人员")
 			}
 			return validatePerson(value[0])
 		},
@@ -193,20 +200,20 @@ func TestParseUsesSafeLocalRepairByDefault(t *testing.T) {
 
 func TestParsePassesSchemaAndFailureToRepair(t *testing.T) {
 	raw := `{"name":"Alice","age":"wrong","tags":[],"active":true}`
-	var received RepairRequest
+	var received LLMRepairRequest
 	result, err := Parse[Person](context.Background(), raw, ParseOptions[Person]{
 		Schema: personSchema,
-		Repair: func(_ context.Context, request RepairRequest) (string, error) {
+		LLMRepair: func(_ context.Context, request LLMRepairRequest) (string, error) {
 			received = request
 			return `{"name":"Alice","age":18,"tags":[],"active":true}`, nil
 		},
-		AllowSemanticRepair: true,
+		AllowLLMSemanticRepair: true,
 	})
 	if err != nil {
-		t.Fatalf("Parse with external repair: %v", err)
+		t.Fatalf("使用大模型修复解析失败: %v", err)
 	}
-	if result.Path != ParsePathExternalRepair {
-		t.Fatalf("path = %q, want %q", result.Path, ParsePathExternalRepair)
+	if result.Path != ParsePathLLMRepair {
+		t.Fatalf("path = %q, want %q", result.Path, ParsePathLLMRepair)
 	}
 	if received.RawOutput != raw || received.Schema != personSchema || received.ValidationFailure == "" {
 		t.Fatalf("unexpected repair request: %#v", received)
@@ -217,7 +224,7 @@ func TestParseTopLevelArrayThroughRepair(t *testing.T) {
 	schema := `{"type":"array","minItems":1,"items":{"type":"integer"}}`
 	result, err := Parse[[]int](context.Background(), "numbers are one and two", ParseOptions[[]int]{
 		Schema: schema,
-		Repair: func(_ context.Context, request RepairRequest) (string, error) {
+		LLMRepair: func(_ context.Context, request LLMRepairRequest) (string, error) {
 			if request.Schema != schema {
 				t.Fatalf("Schema = %q, want %q", request.Schema, schema)
 			}
@@ -225,9 +232,9 @@ func TestParseTopLevelArrayThroughRepair(t *testing.T) {
 		},
 	})
 	if err != nil {
-		t.Fatalf("Parse array with external repair: %v", err)
+		t.Fatalf("使用大模型修复解析数组失败: %v", err)
 	}
-	if result.Path != ParsePathExternalRepair || len(result.Value) != 2 {
+	if result.Path != ParsePathLLMRepair || len(result.Value) != 2 {
 		t.Fatalf("unexpected result: %#v", result)
 	}
 }
@@ -265,16 +272,16 @@ func TestParseLimits(t *testing.T) {
 }
 
 func TestParseRepairFailureIsStructuredAndWrapped(t *testing.T) {
-	repairFailure := errors.New("provider unavailable")
+	repairFailure := errors.New("大模型供应商不可用")
 	_, err := Parse[Person](context.Background(), "not json", ParseOptions[Person]{
 		Schema: personSchema,
-		Repair: func(context.Context, RepairRequest) (string, error) {
+		LLMRepair: func(context.Context, LLMRepairRequest) (string, error) {
 			return "", repairFailure
 		},
 	})
-	parseErr := assertParseError(t, err, ErrorCodeRepairFailed)
-	if parseErr.Stage != ParseStageRepair {
-		t.Fatalf("stage = %q, want %q", parseErr.Stage, ParseStageRepair)
+	parseErr := assertParseError(t, err, ErrorCodeLLMRepairFailed)
+	if parseErr.Stage != ParseStageLLMRepair {
+		t.Fatalf("stage = %q, want %q", parseErr.Stage, ParseStageLLMRepair)
 	}
 	if !errors.Is(err, repairFailure) {
 		t.Fatalf("error must wrap repair failure: %v", err)
@@ -284,11 +291,11 @@ func TestParseRepairFailureIsStructuredAndWrapped(t *testing.T) {
 func TestParseRejectsInvalidRepairOutput(t *testing.T) {
 	_, err := Parse[Person](context.Background(), "not json", ParseOptions[Person]{
 		Schema: personSchema,
-		Repair: func(context.Context, RepairRequest) (string, error) {
+		LLMRepair: func(context.Context, LLMRepairRequest) (string, error) {
 			return `{"name":"Alice","age":"wrong"}`, nil
 		},
 	})
-	parseErr := assertParseError(t, err, ErrorCodeRepairFailed)
+	parseErr := assertParseError(t, err, ErrorCodeLLMRepairFailed)
 	if parseErr.Stage != ParseStageValidation {
 		t.Fatalf("stage = %q, want %q", parseErr.Stage, ParseStageValidation)
 	}
@@ -328,4 +335,126 @@ func TestParseReportsRejectedLossyRepair(t *testing.T) {
 		LocalRepair: LocalJSONRepair,
 	})
 	assertParseError(t, err, ErrorCodeLossyRepair)
+}
+
+// openAIChatModel 是仅供集成测试使用的最小 OpenAI-compatible ChatModel。
+// baseURL 应指向 API 根路径，例如 https://api.openai.com/v1。
+type openAIChatModel struct {
+	baseURL string
+	apiKey  string
+	model   string
+	client  *http.Client
+}
+
+func (m *openAIChatModel) Generate(ctx context.Context, systemPrompt, userPrompt string) (string, error) {
+	requestBody := struct {
+		Model       string `json:"model"`
+		Temperature int    `json:"temperature"`
+		Messages    []struct {
+			Role    string `json:"role"`
+			Content string `json:"content"`
+		} `json:"messages"`
+	}{Model: m.model, Temperature: 0}
+	requestBody.Messages = append(requestBody.Messages,
+		struct {
+			Role    string `json:"role"`
+			Content string `json:"content"`
+		}{Role: "system", Content: systemPrompt},
+		struct {
+			Role    string `json:"role"`
+			Content string `json:"content"`
+		}{Role: "user", Content: userPrompt},
+	)
+
+	body, err := json.Marshal(requestBody)
+	if err != nil {
+		return "", fmt.Errorf("序列化大模型请求失败: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		strings.TrimRight(m.baseURL, "/")+"/chat/completions", bytes.NewReader(body))
+	if err != nil {
+		return "", fmt.Errorf("创建大模型请求失败: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+m.apiKey)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := m.client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("调用大模型失败: %w", err)
+	}
+	defer resp.Body.Close()
+	responseBody, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return "", fmt.Errorf("读取大模型响应失败: %w", err)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", fmt.Errorf("大模型返回异常状态码 %d: %s", resp.StatusCode, responseBody)
+	}
+
+	var chatResponse struct {
+		Choices []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+	if err := json.Unmarshal(responseBody, &chatResponse); err != nil {
+		return "", fmt.Errorf("解码大模型响应失败: %w", err)
+	}
+	if len(chatResponse.Choices) == 0 || strings.TrimSpace(chatResponse.Choices[0].Message.Content) == "" {
+		return "", errors.New("大模型未返回有效内容")
+	}
+	return chatResponse.Choices[0].Message.Content, nil
+}
+
+// TestParseWithOpenAIRepairIntegration 走完整链路：语义校验失败、调用模型修复、再次本地验收。
+// 运行示例：
+// OPENAI_API_KEY=... OPENAI_MODEL=gpt-4.1-mini go test -run TestParseWithOpenAIRepairIntegration -v
+// OPENAI_BASE_URL 可选，默认 https://api.openai.com/v1，也可替换成任意 OpenAI-compatible 服务。
+func TestParseWithOpenAIRepairIntegration(t *testing.T) {
+	apiKey := os.Getenv("OPENAI_API_KEY")
+	modelName := os.Getenv("OPENAI_MODEL")
+	if apiKey == "" || modelName == "" {
+		t.Skip("set OPENAI_API_KEY and OPENAI_MODEL to run the live model integration test")
+	}
+	baseURL := os.Getenv("OPENAI_BASE_URL")
+	if baseURL == "" {
+		baseURL = "https://api.openai.com/v1"
+	}
+
+	chatModel := &openAIChatModel{
+		baseURL: baseURL,
+		apiKey:  apiKey,
+		model:   modelName,
+		client:  &http.Client{Timeout: 30 * time.Second},
+	}
+	llmRepairFunc := func(ctx context.Context, req LLMRepairRequest) (string, error) {
+		return chatModel.Generate(ctx,
+			"You repair JSON. Return exactly one JSON value and no Markdown or explanation. Never add fields outside the schema.",
+			fmt.Sprintf("Repair the model output so it satisfies the JSON Schema.\nSchema:\n%s\nValidation failure:\n%s\nModel output:\n%s",
+				req.Schema, req.ValidationFailure, req.RawOutput),
+		)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	result, err := Parse[Person](ctx,
+		`{"name":"Alice","age":"eighteen","tags":["go"],"active":true}`,
+		ParseOptions[Person]{
+			Schema:                 personSchema,
+			Validate:               validatePerson,
+			LLMRepair:              llmRepairFunc,
+			AllowLLMSemanticRepair: true,
+		},
+	)
+	if err != nil {
+		t.Fatalf("Parse with live OpenAI repair: %v", err)
+	}
+	if result.Path != ParsePathLLMRepair || !result.UsedRepair {
+		t.Fatalf("unexpected repair path: path=%q usedRepair=%v", result.Path, result.UsedRepair)
+	}
+	if result.Value.Name == nil || *result.Value.Name != "Alice" || result.Value.Age == nil {
+		t.Fatalf("unexpected repaired value: %#v", result.Value)
+	}
+	t.Logf("大模型修复成功: json=%s", result.JSON)
 }

@@ -17,26 +17,26 @@ func parseResult[T any](ctx context.Context, rawOutput string, options ParseOpti
 		return ParseResult[T]{}, newParseError(
 			ErrorCodeInputTooLarge,
 			ParseStageInput,
-			fmt.Errorf("input is %d bytes, limit is %d", len(rawOutput), limits.MaxInputBytes),
+			fmt.Errorf("模型输出为 %d 字节，超过输入限制 %d 字节", len(rawOutput), limits.MaxInputBytes),
 		)
 	}
 
 	rawOutput = strings.TrimSpace(rawOutput)
 	if rawOutput == "" {
-		return ParseResult[T]{}, newParseError(ErrorCodeEmptyOutput, ParseStageInput, errors.New("empty output"))
+		return ParseResult[T]{}, newParseError(ErrorCodeEmptyOutput, ParseStageInput, errors.New("模型输出为空"))
 	}
 	if len(options.Schema) > limits.MaxSchemaBytes {
 		return ParseResult[T]{RawOutput: rawOutput}, newParseError(
 			ErrorCodeInvalidSchema,
 			ParseStageSchema,
-			fmt.Errorf("schema is %d bytes, limit is %d", len(options.Schema), limits.MaxSchemaBytes),
+			fmt.Errorf("Schema 为 %d 字节，超过限制 %d 字节", len(options.Schema), limits.MaxSchemaBytes),
 		)
 	}
-	if options.Repair != nil && strings.TrimSpace(options.Schema) == "" {
+	if options.LLMRepair != nil && strings.TrimSpace(options.Schema) == "" {
 		return ParseResult[T]{RawOutput: rawOutput}, newParseError(
 			ErrorCodeInvalidSchema,
 			ParseStageSchema,
-			errors.New("Schema is required when external repair is enabled"),
+			errors.New("启用大模型修复时必须提供 Schema"),
 		)
 	}
 	schema, err := compileJSONSchema(options.Schema)
@@ -113,35 +113,35 @@ func parseResult[T any](ctx context.Context, rawOutput string, options ParseOpti
 	}
 
 	// 6. 外部兜底最多调用一次；语义修复必须显式开启，防止修复器改写业务事实。
-	if options.Repair != nil && (!sawSemanticError || options.AllowSemanticRepair) {
-		validationFailure := "no JSON candidate passed local decoding and validation"
+	if options.LLMRepair != nil && (!sawSemanticError || options.AllowLLMSemanticRepair) {
+		validationFailure := "没有 JSON 候选通过本地解码与校验"
 		if lastFailure != nil {
 			validationFailure = lastFailure.Error()
 		}
-		fixed, err := options.Repair(ctx, RepairRequest{
+		fixed, err := options.LLMRepair(ctx, LLMRepairRequest{
 			RawOutput:         rawOutput,
 			Schema:            options.Schema,
 			ValidationFailure: validationFailure,
 		})
 		if err != nil {
-			return ParseResult[T]{RawOutput: rawOutput}, newParseError(ErrorCodeRepairFailed, ParseStageRepair, err)
+			return ParseResult[T]{RawOutput: rawOutput}, newParseError(ErrorCodeLLMRepairFailed, ParseStageLLMRepair, err)
 		}
 
 		fixed = strings.TrimSpace(fixed)
 		if len(fixed) > limits.MaxCandidateBytes {
 			return ParseResult[T]{RawOutput: rawOutput}, newParseError(
-				ErrorCodeRepairFailed,
-				ParseStageRepair,
-				fmt.Errorf("external repair output is %d bytes, candidate limit is %d", len(fixed), limits.MaxCandidateBytes),
+				ErrorCodeLLMRepairFailed,
+				ParseStageLLMRepair,
+				fmt.Errorf("大模型修复结果为 %d 字节，超过候选大小限制 %d 字节", len(fixed), limits.MaxCandidateBytes),
 			)
 		}
 		value, err := decodeAndValidate[T]([]byte(fixed), schema, options.Validate)
 		if err != nil {
-			return ParseResult[T]{RawOutput: rawOutput}, newParseError(ErrorCodeRepairFailed, ParseStageValidation, err)
+			return ParseResult[T]{RawOutput: rawOutput}, newParseError(ErrorCodeLLMRepairFailed, ParseStageValidation, err)
 		}
 
 		return ParseResult[T]{
-			Value: value, JSON: fixed, Path: ParsePathExternalRepair,
+			Value: value, JSON: fixed, Path: ParsePathLLMRepair,
 			RawOutput: rawOutput, UsedRepair: true,
 		}, nil
 	}
@@ -150,7 +150,7 @@ func parseResult[T any](ctx context.Context, rawOutput string, options ParseOpti
 	// 限制类错误单独返回，因为不调整限制时重试相同输入没有意义。
 	if len(candidates) == 0 {
 		if limitReached {
-			return ParseResult[T]{RawOutput: rawOutput}, newParseError(ErrorCodeCandidateLimit, ParseStageExtraction, errors.New("candidate limit reached"))
+			return ParseResult[T]{RawOutput: rawOutput}, newParseError(ErrorCodeCandidateLimit, ParseStageExtraction, errors.New("已达到 JSON 候选限制"))
 		}
 		return ParseResult[T]{RawOutput: rawOutput}, newParseError(ErrorCodeNoCandidate, ParseStageExtraction, ErrNoJSONCandidate)
 	}
@@ -161,9 +161,9 @@ func parseResult[T any](ctx context.Context, rawOutput string, options ParseOpti
 		return ParseResult[T]{RawOutput: rawOutput}, newParseError(ErrorCodeLossyRepair, ParseStageLocalRepair, lastLossyRepairError)
 	}
 	if limitReached {
-		return ParseResult[T]{RawOutput: rawOutput}, newParseError(ErrorCodeCandidateLimit, ParseStageExtraction, errors.New("candidate limit reached"))
+		return ParseResult[T]{RawOutput: rawOutput}, newParseError(ErrorCodeCandidateLimit, ParseStageExtraction, errors.New("已达到 JSON 候选限制"))
 	}
-	return ParseResult[T]{RawOutput: rawOutput}, newParseError(ErrorCodeInvalidJSON, ParseStageLocalRepair, errors.New("local parsing and repair failed"))
+	return ParseResult[T]{RawOutput: rawOutput}, newParseError(ErrorCodeInvalidJSON, ParseStageLocalRepair, errors.New("本地解析与修复失败"))
 }
 
 // Parse 将不可信的模型文本转换为 T。

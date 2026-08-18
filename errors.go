@@ -7,13 +7,13 @@ import (
 
 var (
 	// ErrNoJSONCandidate 用于判断文本中不存在可恢复 JSON 边界的情况。
-	ErrNoJSONCandidate = errors.New("no complete JSON candidate found")
+	ErrNoJSONCandidate = errors.New("未找到完整的 JSON 候选")
 	// ErrInvalidOutput 是所有模型输出解析失败共享的哨兵错误。
-	ErrInvalidOutput = errors.New("model output could not be parsed and validated")
+	ErrInvalidOutput = errors.New("模型输出无法通过解析与校验")
 	// ErrLossyRepair 用于识别本地修复可能新增、删除或重组业务数据的情况。
-	ErrLossyRepair = errors.New("lossy JSON repair rejected")
-	// ErrRepairRefused 表示外部修复器明确拒绝可能改变业务事实的修复。
-	ErrRepairRefused = errors.New("external repair refused unsafe JSON repair")
+	ErrLossyRepair = errors.New("已拒绝可能改变业务语义的 JSON 修复")
+	// ErrLLMRepairRefused 表示大模型修复器明确拒绝可能改变业务事实的修复。
+	ErrLLMRepairRefused = errors.New("大模型修复器拒绝执行不安全的 JSON 修复")
 )
 
 // ErrorCode 提供稳定的失败分类，供指标统计和重试策略使用。
@@ -29,7 +29,7 @@ const (
 	ErrorCodeLossyRepair      ErrorCode = "lossy_repair_rejected"
 	ErrorCodeValidationFailed ErrorCode = "validation_failed"
 	ErrorCodeCandidateLimit   ErrorCode = "candidate_limit"
-	ErrorCodeRepairFailed     ErrorCode = "external_repair_failed"
+	ErrorCodeLLMRepairFailed  ErrorCode = "llm_repair_failed"
 )
 
 // ParseStage 标识输出在可信处理链路中停止的阶段。
@@ -42,7 +42,7 @@ const (
 	ParseStageExtraction  ParseStage = "extraction"
 	ParseStageLocalRepair ParseStage = "local_repair"
 	ParseStageValidation  ParseStage = "validation"
-	ParseStageRepair      ParseStage = "external_repair"
+	ParseStageLLMRepair   ParseStage = "llm_repair"
 )
 
 // ParseError 提供错误码、阶段和根因，使调用方无需解析文案即可决定重试、降级或拒绝。
@@ -56,12 +56,12 @@ type ParseError struct {
 // Error 返回简洁诊断信息，不包含可能敏感的原始模型输出。
 func (e *ParseError) Error() string {
 	if e == nil {
-		return "nil parse error"
+		return "空的解析错误"
 	}
 	if e.Cause == nil {
-		return fmt.Sprintf("%s at %s", e.Code, e.Stage)
+		return fmt.Sprintf("%s，阶段：%s", e.Code, e.Stage)
 	}
-	return fmt.Sprintf("%s at %s: %v", e.Code, e.Stage, e.Cause)
+	return fmt.Sprintf("%s，阶段：%s，原因：%v", e.Code, e.Stage, e.Cause)
 }
 
 // Unwrap 同时暴露包级哨兵错误和根因，兼容不同版本调用方的错误判断方式。

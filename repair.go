@@ -18,10 +18,10 @@ func LocalJSONRepair(input string) (string, error) {
 
 	repaired, err := jsonrepair.JSONRepair(input)
 	if err != nil {
-		return "", fmt.Errorf("repair JSON: %w", err)
+		return "", fmt.Errorf("JSON 修复失败: %w", err)
 	}
 	if rootChanged(input, repaired) {
-		return "", fmt.Errorf("%w: root JSON type changed", ErrLossyRepair)
+		return "", fmt.Errorf("%w: JSON 根类型发生变化", ErrLossyRepair)
 	}
 	return repaired, nil
 }
@@ -31,7 +31,7 @@ func LocalJSONRepair(input string) (string, error) {
 func PermissiveLocalJSONRepair(input string) (string, error) {
 	repaired, err := jsonrepair.JSONRepair(input)
 	if err != nil {
-		return "", fmt.Errorf("repair JSON: %w", err)
+		return "", fmt.Errorf("JSON 修复失败: %w", err)
 	}
 	return repaired, nil
 }
@@ -66,13 +66,13 @@ func detectLossyRepairRisk(input string) string {
 
 		switch {
 		case current == ':' && missingValueAfter(input, index+1):
-			return "object field has no source value"
+			return "对象字段缺少原始值"
 		case strings.HasPrefix(input[index:], "..."):
-			return "ellipsis would be deleted"
+			return "省略号内容会被删除"
 		case hasStandaloneToken(input, index, "undefined"):
-			return "undefined would be replaced with null"
+			return "undefined 会被替换为 null"
 		case current == '+':
-			return "concatenated values would be merged"
+			return "拼接表达式会被合并为新值"
 		}
 	}
 	return ""

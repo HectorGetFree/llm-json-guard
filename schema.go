@@ -21,7 +21,7 @@ type compiledSchema struct {
 type localOnlySchemaLoader struct{}
 
 func (localOnlySchemaLoader) Load(url string) (any, error) {
-	return nil, fmt.Errorf("external Schema reference is not allowed: %s", url)
+	return nil, fmt.Errorf("不允许引用外部 Schema: %s", url)
 }
 
 // compileJSONSchema 在处理模型输出前编译调用方契约。
@@ -33,18 +33,18 @@ func compileJSONSchema(source string) (*compiledSchema, error) {
 
 	document, err := jsonschema.UnmarshalJSON(bytes.NewBufferString(source))
 	if err != nil {
-		return nil, fmt.Errorf("decode JSON Schema: %w", err)
+		return nil, fmt.Errorf("JSON Schema 解码失败: %w", err)
 	}
 
 	compiler := jsonschema.NewCompiler()
 	// Schema 属于调用方提供的不可信配置，禁止编译器通过外部引用读取文件或访问网络。
 	compiler.UseLoader(localOnlySchemaLoader{})
 	if err := compiler.AddResource(schemaResourceURL, document); err != nil {
-		return nil, fmt.Errorf("register JSON Schema: %w", err)
+		return nil, fmt.Errorf("JSON Schema 注册失败: %w", err)
 	}
 	schema, err := compiler.Compile(schemaResourceURL)
 	if err != nil {
-		return nil, fmt.Errorf("compile JSON Schema: %w", err)
+		return nil, fmt.Errorf("JSON Schema 编译失败: %w", err)
 	}
 	return &compiledSchema{schema: schema, rootTypes: schemaRootTypes(document)}, nil
 }
@@ -58,10 +58,10 @@ func (schema *compiledSchema) validate(input []byte) error {
 
 	instance, err := jsonschema.UnmarshalJSON(bytes.NewReader(input))
 	if err != nil {
-		return fmt.Errorf("decode JSON for Schema validation: %w", err)
+		return fmt.Errorf("Schema 校验前的 JSON 解码失败: %w", err)
 	}
 	if err := schema.schema.Validate(instance); err != nil {
-		return fmt.Errorf("validate JSON Schema: %w", err)
+		return fmt.Errorf("JSON Schema 校验失败: %w", err)
 	}
 	return nil
 }
