@@ -9,9 +9,9 @@ import (
 	jsonrepair "github.com/kaptinlin/jsonrepair"
 )
 
-// LocalJSONRepair 在外部兜底前提供确定性语法恢复。
+// localJSONRepair 在大模型兜底前提供确定性语法恢复。
 // 默认拒绝补值、删除占位内容和根结构重组，防止通用修复库静默改变业务事实。
-func LocalJSONRepair(input string) (string, error) {
+func localJSONRepair(input string) (string, error) {
 	if reason := detectLossyRepairRisk(input); reason != "" {
 		return "", fmt.Errorf("%w: %s", ErrLossyRepair, reason)
 	}
@@ -22,16 +22,6 @@ func LocalJSONRepair(input string) (string, error) {
 	}
 	if rootChanged(input, repaired) {
 		return "", fmt.Errorf("%w: JSON 根类型发生变化", ErrLossyRepair)
-	}
-	return repaired, nil
-}
-
-// PermissiveLocalJSONRepair 暴露第三方库的完整恢复能力。
-// 调用方只有在接受补 null、删除省略内容或重组根结构时才应显式启用。
-func PermissiveLocalJSONRepair(input string) (string, error) {
-	repaired, err := jsonrepair.JSONRepair(input)
-	if err != nil {
-		return "", fmt.Errorf("JSON 修复失败: %w", err)
 	}
 	return repaired, nil
 }

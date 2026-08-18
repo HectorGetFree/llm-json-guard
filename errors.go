@@ -9,11 +9,9 @@ var (
 	// ErrNoJSONCandidate 用于判断文本中不存在可恢复 JSON 边界的情况。
 	ErrNoJSONCandidate = errors.New("未找到完整的 JSON 候选")
 	// ErrInvalidOutput 是所有模型输出解析失败共享的哨兵错误。
-	ErrInvalidOutput = errors.New("模型输出无法通过解析与校验")
+	ErrInvalidOutput = errors.New("模型输出无法通过本地解析与修复")
 	// ErrLossyRepair 用于识别本地修复可能新增、删除或重组业务数据的情况。
 	ErrLossyRepair = errors.New("已拒绝可能改变业务语义的 JSON 修复")
-	// ErrLLMRepairRefused 表示大模型修复器明确拒绝可能改变业务事实的修复。
-	ErrLLMRepairRefused = errors.New("大模型修复器拒绝执行不安全的 JSON 修复")
 )
 
 // ErrorCode 提供稳定的失败分类，供指标统计和重试策略使用。
@@ -21,15 +19,13 @@ type ErrorCode string
 
 // 稳定错误码用于区分可重试的恢复错误和终止性的校验错误。
 const (
-	ErrorCodeEmptyOutput      ErrorCode = "empty_output"
-	ErrorCodeInputTooLarge    ErrorCode = "input_too_large"
-	ErrorCodeInvalidSchema    ErrorCode = "invalid_schema"
-	ErrorCodeNoCandidate      ErrorCode = "no_candidate"
-	ErrorCodeInvalidJSON      ErrorCode = "invalid_json"
-	ErrorCodeLossyRepair      ErrorCode = "lossy_repair_rejected"
-	ErrorCodeValidationFailed ErrorCode = "validation_failed"
-	ErrorCodeCandidateLimit   ErrorCode = "candidate_limit"
-	ErrorCodeLLMRepairFailed  ErrorCode = "llm_repair_failed"
+	ErrorCodeEmptyOutput     ErrorCode = "empty_output"
+	ErrorCodeInputTooLarge   ErrorCode = "input_too_large"
+	ErrorCodeInvalidConfig   ErrorCode = "invalid_config"
+	ErrorCodeNoCandidate     ErrorCode = "no_candidate"
+	ErrorCodeInvalidJSON     ErrorCode = "invalid_json"
+	ErrorCodeLossyRepair     ErrorCode = "lossy_repair_rejected"
+	ErrorCodeLLMRepairFailed ErrorCode = "llm_repair_failed"
 )
 
 // ParseStage 标识输出在可信处理链路中停止的阶段。
@@ -38,10 +34,8 @@ type ParseStage string
 // 阶段值与错误文案解耦，避免文案调整破坏监控面板。
 const (
 	ParseStageInput       ParseStage = "input"
-	ParseStageSchema      ParseStage = "schema"
 	ParseStageExtraction  ParseStage = "extraction"
 	ParseStageLocalRepair ParseStage = "local_repair"
-	ParseStageValidation  ParseStage = "validation"
 	ParseStageLLMRepair   ParseStage = "llm_repair"
 )
 

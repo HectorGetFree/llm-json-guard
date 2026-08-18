@@ -8,166 +8,97 @@ import (
 	"strings"
 )
 
-// parseResult 按成本和风险从低到高调度恢复链路。
-// 无论通过哪条路径恢复，结果都必须经过相同的本地解码和业务校验。
-func parseResult[T any](ctx context.Context, rawOutput string, options ParseOptions[T]) (ParseResult[T], error) {
-	// 1. 提取前校验输入规模，避免异常模型输出占用过多内存和扫描时间。
-	limits := normalizeLimits(options.Limits)
-	if len(rawOutput) > limits.MaxInputBytes {
-		return ParseResult[T]{}, newParseError(
+// Parse 将不可信的模型文本转换为 T。
+// 本地链路失败且传入 llmRepair 时才会调用一次大模型；模型结果只会重新走本地链路，避免循环修复。
+func Parse[T any](ctx context.Context, rawOutput, jsonFormat string, llmRepair LLMRepairFunc) (T, string, error) {
+	var zero T
+	if llmRepair != nil && strings.TrimSpace(jsonFormat) == "" {
+		return zero, "", newParseError(ErrorCodeInvalidConfig, ParseStageInput, errors.New("启用大模型修复时必须提供 JSON 格式说明"))
+	}
+
+	value, jsonText, localErr := parseLocal[T](rawOutput)
+	if localErr == nil {
+		return value, jsonText, nil
+	}
+	if llmRepair == nil {
+		return zero, "", localErr
+	}
+
+	// 大模型只处理本地无法恢复的格式或明确类型问题，失败原因用于缩小修复范围。
+	repaired, err := llmRepair(ctx, LLMRepairRequest{
+		RawOutput:     strings.TrimSpace(rawOutput),
+		JSONFormat:    jsonFormat,
+		FailureReason: localErr.Error(),
+	})
+	if err != nil {
+		return zero, "", newParseError(ErrorCodeLLMRepairFailed, ParseStageLLMRepair, err)
+	}
+	if strings.TrimSpace(repaired) == "" {
+		return zero, "", newParseError(ErrorCodeLLMRepairFailed, ParseStageLLMRepair, errors.New("大模型修复结果为空"))
+	}
+
+	value, jsonText, err = parseLocal[T](repaired)
+	if err != nil {
+		return zero, "", newParseError(ErrorCodeLLMRepairFailed, ParseStageLLMRepair, err)
+	}
+	return value, jsonText, nil
+}
+
+// parseLocal 统一执行无网络副作用的解析、提取和安全语法修复。
+func parseLocal[T any](rawOutput string) (T, string, error) {
+	var zero T
+	if len(rawOutput) > maxInputBytes {
+		return zero, "", newParseError(
 			ErrorCodeInputTooLarge,
 			ParseStageInput,
-			fmt.Errorf("模型输出为 %d 字节，超过输入限制 %d 字节", len(rawOutput), limits.MaxInputBytes),
+			fmt.Errorf("模型输出为 %d 字节，超过内部限制 %d 字节", len(rawOutput), maxInputBytes),
 		)
 	}
 
 	rawOutput = strings.TrimSpace(rawOutput)
 	if rawOutput == "" {
-		return ParseResult[T]{}, newParseError(ErrorCodeEmptyOutput, ParseStageInput, errors.New("模型输出为空"))
-	}
-	if len(options.Schema) > limits.MaxSchemaBytes {
-		return ParseResult[T]{RawOutput: rawOutput}, newParseError(
-			ErrorCodeInvalidSchema,
-			ParseStageSchema,
-			fmt.Errorf("Schema 为 %d 字节，超过限制 %d 字节", len(options.Schema), limits.MaxSchemaBytes),
-		)
-	}
-	if options.LLMRepair != nil && strings.TrimSpace(options.Schema) == "" {
-		return ParseResult[T]{RawOutput: rawOutput}, newParseError(
-			ErrorCodeInvalidSchema,
-			ParseStageSchema,
-			errors.New("启用大模型修复时必须提供 Schema"),
-		)
-	}
-	schema, err := compileJSONSchema(options.Schema)
-	if err != nil {
-		return ParseResult[T]{RawOutput: rawOutput}, newParseError(ErrorCodeInvalidSchema, ParseStageSchema, err)
+		return zero, "", newParseError(ErrorCodeEmptyOutput, ParseStageInput, errors.New("模型输出为空"))
 	}
 
-	// 2. 优先解析原始输出，保留模型原意，并避免对正常输出执行不必要的恢复。
-	var lastFailure error
-	if len(rawOutput) <= limits.MaxCandidateBytes {
-		if value, decodeErr := decodeAndValidate[T]([]byte(rawOutput), schema, options.Validate); decodeErr == nil {
-			return ParseResult[T]{Value: value, JSON: rawOutput, Path: ParsePathDirect, RawOutput: rawOutput}, nil
-		} else {
-			lastFailure = decodeErr
-		}
+	// 1. 优先保留合法原始输出，避免对正常结果执行不必要的转换。
+	if value, err := decodeStrict[T]([]byte(rawOutput)); err == nil {
+		return value, rawOutput, nil
 	}
 
-	// 3. 只标准化字符串外的结构标点，再按限制提取候选，避免修改业务字段内容。
+	// 2. 标准化字符串外的结构标点并提取候选，兼容 Markdown 和自然语言包裹。
 	normalizedOutput := normalizeStructurePunctuation(rawOutput)
-	candidates, limitReached := extractJSONCandidatesWithLimits(normalizedOutput, limits)
-	sawSemanticError := false
-	sawLossyRepair := false
-	var lastSemanticError error
-	var lastLossyRepairError error
-
-	// 4. 优先选择无需修复且通过本地规则的候选。
-	// 合法 JSON 如果校验失败，应归类为语义错误，不能交给语法修复器静默改写。
+	candidates := extractJSONCandidates(normalizedOutput)
+	var lastFailure error
 	for _, candidate := range candidates {
-		value, err := decodeAndValidate[T]([]byte(candidate), schema, options.Validate)
+		value, err := decodeStrict[T]([]byte(candidate))
 		if err == nil {
-			return ParseResult[T]{Value: value, JSON: candidate, Path: ParsePathExtracted, RawOutput: rawOutput}, nil
+			return value, candidate, nil
 		}
 		lastFailure = err
-		if json.Valid([]byte(candidate)) && schema.matchesRootType(candidate) {
-			sawSemanticError = true
-			if lastSemanticError == nil {
-				lastSemanticError = err
-			}
-		}
 	}
 
-	// 5. 仅修复语法非法的候选，避免把 Schema 或业务错误伪装成格式问题。
-	localRepair := options.LocalRepair
-	if localRepair == nil && !options.DisableLocalRepair {
-		localRepair = LocalJSONRepair
-	}
-	if localRepair != nil {
-		for _, candidate := range candidates {
-			if json.Valid([]byte(candidate)) {
-				continue
-			}
-
-			repaired, err := localRepair(candidate)
-			if err != nil {
-				lastFailure = err
-				if errors.Is(err, ErrLossyRepair) {
-					sawLossyRepair = true
-					lastLossyRepairError = err
-				}
-				continue
-			}
-
-			value, err := decodeAndValidate[T]([]byte(repaired), schema, options.Validate)
-			if err != nil {
-				lastFailure = err
-				continue
-			}
-
-			return ParseResult[T]{
-				Value: value, JSON: repaired, Path: ParsePathLocalFix,
-				RawOutput: rawOutput, UsedRepair: true,
-			}, nil
+	// 3. 本地修复只处理语法非法候选；类型不匹配等问题保留给可选的大模型修复。
+	for _, candidate := range candidates {
+		if json.Valid([]byte(candidate)) {
+			continue
 		}
-	}
-
-	// 6. 外部兜底最多调用一次；语义修复必须显式开启，防止修复器改写业务事实。
-	if options.LLMRepair != nil && (!sawSemanticError || options.AllowLLMSemanticRepair) {
-		validationFailure := "没有 JSON 候选通过本地解码与校验"
-		if lastFailure != nil {
-			validationFailure = lastFailure.Error()
-		}
-		fixed, err := options.LLMRepair(ctx, LLMRepairRequest{
-			RawOutput:         rawOutput,
-			Schema:            options.Schema,
-			ValidationFailure: validationFailure,
-		})
+		repaired, err := localJSONRepair(candidate)
 		if err != nil {
-			return ParseResult[T]{RawOutput: rawOutput}, newParseError(ErrorCodeLLMRepairFailed, ParseStageLLMRepair, err)
+			lastFailure = err
+			continue
 		}
-
-		fixed = strings.TrimSpace(fixed)
-		if len(fixed) > limits.MaxCandidateBytes {
-			return ParseResult[T]{RawOutput: rawOutput}, newParseError(
-				ErrorCodeLLMRepairFailed,
-				ParseStageLLMRepair,
-				fmt.Errorf("大模型修复结果为 %d 字节，超过候选大小限制 %d 字节", len(fixed), limits.MaxCandidateBytes),
-			)
+		value, err := decodeStrict[T]([]byte(repaired))
+		if err == nil {
+			return value, repaired, nil
 		}
-		value, err := decodeAndValidate[T]([]byte(fixed), schema, options.Validate)
-		if err != nil {
-			return ParseResult[T]{RawOutput: rawOutput}, newParseError(ErrorCodeLLMRepairFailed, ParseStageValidation, err)
-		}
-
-		return ParseResult[T]{
-			Value: value, JSON: fixed, Path: ParsePathLLMRepair,
-			RawOutput: rawOutput, UsedRepair: true,
-		}, nil
+		lastFailure = err
 	}
 
-	// 7. 对最终失败分类，供调用方决策和指标统计。
-	// 限制类错误单独返回，因为不调整限制时重试相同输入没有意义。
 	if len(candidates) == 0 {
-		if limitReached {
-			return ParseResult[T]{RawOutput: rawOutput}, newParseError(ErrorCodeCandidateLimit, ParseStageExtraction, errors.New("已达到 JSON 候选限制"))
-		}
-		return ParseResult[T]{RawOutput: rawOutput}, newParseError(ErrorCodeNoCandidate, ParseStageExtraction, ErrNoJSONCandidate)
+		return zero, "", newParseError(ErrorCodeNoCandidate, ParseStageExtraction, ErrNoJSONCandidate)
 	}
-	if sawSemanticError {
-		return ParseResult[T]{RawOutput: rawOutput}, newParseError(ErrorCodeValidationFailed, ParseStageValidation, lastSemanticError)
+	if lastFailure == nil {
+		lastFailure = errors.New("本地解析与修复失败")
 	}
-	if sawLossyRepair {
-		return ParseResult[T]{RawOutput: rawOutput}, newParseError(ErrorCodeLossyRepair, ParseStageLocalRepair, lastLossyRepairError)
-	}
-	if limitReached {
-		return ParseResult[T]{RawOutput: rawOutput}, newParseError(ErrorCodeCandidateLimit, ParseStageExtraction, errors.New("已达到 JSON 候选限制"))
-	}
-	return ParseResult[T]{RawOutput: rawOutput}, newParseError(ErrorCodeInvalidJSON, ParseStageLocalRepair, errors.New("本地解析与修复失败"))
-}
-
-// Parse 将不可信的模型文本转换为 T。
-// 返回值一定通过严格本地解码和可选业务校验，任何恢复路径都不能绕过该边界。
-func Parse[T any](ctx context.Context, rawOutput string, options ParseOptions[T]) (ParseResult[T], error) {
-	return parseResult(ctx, rawOutput, options)
+	return zero, "", newParseError(ErrorCodeInvalidJSON, ParseStageLocalRepair, lastFailure)
 }

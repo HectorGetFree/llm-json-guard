@@ -9,26 +9,23 @@ import (
 // 即使模型没有直接返回纯 JSON，代码块通常仍能表达明确的载荷范围。
 var fencedCodeBlockPattern = regexp.MustCompile("(?s)```(?:json|JSON)?\\s*(.*?)\\s*```")
 
-// extractJSONCandidatesWithLimits 按模型意图强弱生成候选。
-// Markdown 代码块优先于普通文本中的括号；硬限制用于防止异常输出产生无限候选。
-func extractJSONCandidatesWithLimits(input string, limits ParseLimits) ([]string, bool) {
+// extractJSONCandidates 按模型意图强弱生成候选。
+// Markdown 代码块优先于普通文本中的括号；内部固定限制避免异常输出产生无界候选。
+func extractJSONCandidates(input string) []string {
 	seen := make(map[string]struct{})
 	var candidates []string
-	limitReached := false
 	appendCandidate := func(candidate string) {
 		candidate = strings.TrimSpace(candidate)
 		if candidate == "" {
 			return
 		}
-		if len(candidate) > limits.MaxCandidateBytes {
-			limitReached = true
+		if len(candidate) > maxCandidateBytes {
 			return
 		}
 		if _, exists := seen[candidate]; exists {
 			return
 		}
-		if len(candidates) >= limits.MaxCandidates {
-			limitReached = true
+		if len(candidates) >= maxCandidates {
 			return
 		}
 		seen[candidate] = struct{}{}
@@ -42,27 +39,27 @@ func extractJSONCandidatesWithLimits(input string, limits ParseLimits) ([]string
 		}
 		block := strings.TrimSpace(match[1])
 		appendCandidate(block)
-		if len(candidates) >= limits.MaxCandidates {
-			return candidates, true
+		if len(candidates) >= maxCandidates {
+			return candidates
 		}
-		for _, candidate := range extractBalancedCandidates(block, limits.MaxCandidates-len(candidates)) {
+		for _, candidate := range extractBalancedCandidates(block, maxCandidates-len(candidates)) {
 			appendCandidate(candidate)
 		}
 		appendCandidate(extractIncompleteCandidate(block))
-		if len(candidates) >= limits.MaxCandidates {
-			return candidates, true
+		if len(candidates) >= maxCandidates {
+			return candidates
 		}
 	}
 
 	// 2. 扫描完整响应，兼容在自然语言中直接夹带 JSON 的模型；去重时保留先前优先级。
-	for _, candidate := range extractBalancedCandidates(input, limits.MaxCandidates-len(candidates)) {
+	for _, candidate := range extractBalancedCandidates(input, maxCandidates-len(candidates)) {
 		appendCandidate(candidate)
 	}
-	if len(candidates) >= limits.MaxCandidates {
-		return candidates, true
+	if len(candidates) >= maxCandidates {
+		return candidates
 	}
 	appendCandidate(extractIncompleteCandidate(input))
-	return candidates, limitReached
+	return candidates
 }
 
 // extractIncompleteCandidate 只将未闭合对象或数组保留为修复输入。
